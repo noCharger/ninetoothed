@@ -51,6 +51,8 @@ _ALLOWED_EDIT_BASENAMES = {
     "kernel.py", "kernel_fixed.py", "wrapper.py", "test_correctness.py",
     "bench.csv", "benchmark.csv", "bench_result.txt", "notes.md",
     "matrix.csv", "generated_source.txt", "diagnosis.md",
+    # legitimate process artifacts a real agent may emit while following the workflow
+    "trace.md", "bench.py", "conftest.py",
 }
 
 # the subset of _ALLOWED_EDIT_BASENAMES that is actual *implementation* (as opposed

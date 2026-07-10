@@ -151,7 +151,11 @@ def changed_files(ws: pathlib.Path) -> list[str]:
         rel = p.relative_to(ws)
         if not p.is_file():
             continue
-        if "skill" in rel.parts or "__pycache__" in rel.parts or ".claude" in rel.parts:
+        if "skill" in rel.parts or "__pycache__" in rel.parts:
+            continue
+        # skip hidden dirs/files: .claude (installed skill), .pytest_cache, .git, etc. —
+        # these are tool/cache artifacts, not the agent's deliverable edits.
+        if any(part.startswith(".") for part in rel.parts):
             continue
         if any(part.startswith("_") for part in rel.parts):   # harness artifacts
             continue
