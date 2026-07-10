@@ -44,20 +44,22 @@ _FAKE_FILES = {
 }
 
 
-def load_tasks(manifest: pathlib.Path, split: str) -> list[dict]:
+def load_tasks(manifest: pathlib.Path, split: str, family: str = None) -> list[dict]:
     data = json.loads(manifest.read_text(encoding="utf-8"))
     tasks = data["tasks"]
     if split != "all":
         tasks = [t for t in tasks if t.get("split") == split]
+    if family:
+        tasks = [t for t in tasks if t.get("category") == family]
     return tasks
 
 
 def run_matrix(skill_root, manifest, split, modes, out_dir, run_id, generation,
                journal_path=None, csv_path=None, fake=False, dry_run=False,
-               limit=None, solver_name="claude", model_dir=None):
+               limit=None, solver_name="claude", model_dir=None, family=None):
     skill_root = pathlib.Path(skill_root)
     out_dir = pathlib.Path(out_dir)
-    tasks = load_tasks(pathlib.Path(manifest), split)
+    tasks = load_tasks(pathlib.Path(manifest), split, family)
     if limit:
         tasks = tasks[:limit]
     jnl = Journal(journal_path) if journal_path else None
@@ -145,6 +147,7 @@ def main(argv=None) -> int:
     p.add_argument("--fake", action="store_true", help="offline stub solver (no claude)")
     p.add_argument("--solver", default="claude", choices=["claude", "qwen", "fake"])
     p.add_argument("--model-dir", default=None, help="local model dir for --solver qwen")
+    p.add_argument("--family", default=None, help="restrict to one operator family/category")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--limit", type=int, default=None)
     args = p.parse_args(argv)
@@ -154,7 +157,7 @@ def main(argv=None) -> int:
     out_dir = args.out_dir or skill_root / "evaluation" / "results"
     run_matrix(skill_root, manifest, args.split, args.modes, out_dir, args.run_id,
                args.generation, args.journal, args.csv, args.fake, args.dry_run, args.limit,
-               solver_name=args.solver, model_dir=args.model_dir)
+               solver_name=args.solver, model_dir=args.model_dir, family=args.family)
     return 0
 
 
