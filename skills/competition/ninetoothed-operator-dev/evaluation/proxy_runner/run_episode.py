@@ -83,9 +83,11 @@ def build_prompt(task_meta: dict, mode: str) -> str:
     lines = []
     if mode != "no_skill":
         lines.append(
-            "A NineToothed operator-development skill is available at ./skill/. "
-            "Read ./skill/SKILL.md and the relevant file(s) under ./skill/references/ "
-            "BEFORE writing any code, and follow its workflow and pitfalls."
+            "A `ninetoothed-operator-dev` skill is available (installed as a Claude Code "
+            "skill, and mirrored under ./skill/). USE IT: read its SKILL.md + the relevant "
+            "references, imitate its worked examples under examples/, and run its scripts "
+            "(scripts/run_correctness_matrix.py, scripts/debug_arrangement.py, "
+            "scripts/inspect_generated_source.py) to verify — follow its workflow and pitfalls."
         )
     lines.append(f"Task ({task_meta.get('category','?')}/{task_meta.get('difficulty','?')}): "
                  f"{task_meta.get('prompt','').strip()}")
@@ -104,7 +106,8 @@ def prepare_sandbox(out_dir: pathlib.Path, run_id: str, generation: int,
         shutil.rmtree(ws)
     ws.mkdir(parents=True)
     if mode != "no_skill" and skill_root is not None:
-        _seed_skill(ws / "skill", skill_root)
+        _seed_skill(ws / "skill", skill_root)                 # for inline solvers (qwen/glm-api)
+        _install_skill(ws, skill_root)                        # for the real claude-code harness
     return ws
 
 
@@ -122,6 +125,24 @@ def _seed_skill(dest: pathlib.Path, skill_root: pathlib.Path) -> None:
             shutil.copytree(s, dest / sub, dirs_exist_ok=True)
 
 
+def _install_skill(ws: pathlib.Path, skill_root: pathlib.Path) -> None:
+    """Install the FULL skill (SKILL.md + references + scripts + examples) as a real
+    Claude Code skill under ws/.claude/skills/<name>/, so the agent auto-discovers it and
+    can run its scripts + read its worked examples — the faithful test of the whole skill,
+    not a text excerpt. Excludes evaluation/ (harness) and results/ to keep it clean."""
+    name = skill_root.name  # ninetoothed-operator-dev
+    dest = ws / ".claude" / "skills" / name
+    dest.mkdir(parents=True, exist_ok=True)
+    for item in skill_root.iterdir():
+        if item.name in ("evaluation", ".git", "__pycache__"):
+            continue
+        if item.is_dir():
+            shutil.copytree(item, dest / item.name, dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        else:
+            shutil.copy2(item, dest / item.name)
+
+
 def changed_files(ws: pathlib.Path) -> list[str]:
     """Files the episode produced: everything under ws except the seeded skill/ and
     harness-generated bookkeeping (names starting with '_', e.g. _prompt.txt)."""
@@ -130,7 +151,7 @@ def changed_files(ws: pathlib.Path) -> list[str]:
         rel = p.relative_to(ws)
         if not p.is_file():
             continue
-        if "skill" in rel.parts or "__pycache__" in rel.parts:
+        if "skill" in rel.parts or "__pycache__" in rel.parts or ".claude" in rel.parts:
             continue
         if any(part.startswith("_") for part in rel.parts):   # harness artifacts
             continue
@@ -142,23 +163,40 @@ def changed_files(ws: pathlib.Path) -> list[str]:
 
 # --------------------------------------------------------------------------- solvers
 def default_claude_solver(prompt: str, ws: pathlib.Path, opts: dict) -> SolverResult:
-    """Invoke `claude -p --output-format json` inside the sandbox."""
+    """Invoke `claude -p --output-format json` inside the sandbox — the REAL agent harness.
+
+    This is the faithful test: a tool-using coding agent that can read the whole skill
+    (references + scripts + examples installed under ws/.claude/skills/) and run its
+    workflow via Bash. Backed by whatever model ANTHROPIC_BASE_URL/AUTH_TOKEN +
+    ANTHROPIC_DEFAULT_*_MODEL point at (e.g. glm-5.2 via Zhipu's Anthropic endpoint).
+    Needs IS_SANDBOX=1 in the env so --dangerously-skip-permissions works headless as root.
+    """
     model = opts.get("model") or os.environ.get("NINETOOTHED_EPISODE_MODEL", "")
-    timeout = int(opts.get("timeout", 900))
-    cmd = ["claude", "-p", "--output-format", "json"]
+    timeout = int(opts.get("timeout", 1200))
+    cmd = ["claude", "-p", "--output-format", "json", "--dangerously-skip-permissions"]
     if model:
         cmd += ["--model", model]
-    # allow the tools the workflow needs; keep network off via the sandbox + prompt.
-    cmd += ["--permission-mode", opts.get("permission_mode", "acceptEdits")]
     cmd += [prompt]
+    env = {**os.environ, "IS_SANDBOX": os.environ.get("IS_SANDBOX", "1")}
     t0 = time.time()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=str(ws))
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                              cwd=str(ws), env=env)
     except subprocess.TimeoutExpired:
         return SolverResult(wall_seconds=timeout, compiled=False, compile_attempts=0,
                             raw={"error": "timeout"})
     wall = time.time() - t0
-    return _parse_claude_json(proc.stdout, wall)
+    res = _parse_claude_json(proc.stdout, wall)
+    # set the compiled flag from an independent solve() check (agent's own claims aside)
+    task_id = opts.get("task_id"); ptd = opts.get("proxy_tasks_dir")
+    if opts.get("kind", "operator") == "operator" and task_id and ptd:
+        try:
+            from qwen_solver import _solve_runs
+            ok, _ = _solve_runs(ws, task_id, ptd)
+            res.compiled = ok
+        except Exception:  # noqa: BLE001
+            pass
+    return res
 
 
 def _parse_claude_json(stdout: str, wall: float) -> SolverResult:
