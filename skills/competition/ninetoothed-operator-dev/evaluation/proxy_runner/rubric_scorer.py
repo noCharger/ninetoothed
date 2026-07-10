@@ -204,13 +204,17 @@ def score_completion(workspace: pathlib.Path, task_meta: dict, skill_root: pathl
     else:
         val = max(1, min(3, round(frac * 4)))
     # The task is to implement a NineToothed operator. A correct-output solution that
-    # does NOT actually use the DSL (pure torch, or a hallucinated fake API) has not
-    # fulfilled the task — cap its completion so the skill's real-API value is what counts.
-    if val >= 2 and not _uses_ninetoothed(workspace):
-        val = 1
-        reason += " (capped: solution does not use NineToothed)"
-        if not detail:
-            detail = "solution does not use NineToothed (no import+make)"
+    # does NOT actually use the DSL (pure torch, or a hallucinated fake API), or that
+    # reaches a banned torch/aten matmul-conv-reduction fallback (MusaCoder/KernelBench
+    # legality convention), has not fulfilled the task even though the numbers match —
+    # cap its completion so the skill's real-API value is what counts.
+    if val >= 2:
+        legality_reason = _legality_violation(workspace, skill_root)
+        if legality_reason:
+            val = 1
+            reason += f" (capped: {legality_reason})"
+            if not detail:
+                detail = legality_reason
     return SubScore(val, 4, reason), frac, detail
 
 
@@ -223,6 +227,44 @@ def _uses_ninetoothed(workspace: pathlib.Path) -> bool:
         if "ninetoothed" in src and re.search(r"\bmake\s*\(", src):
             return True
     return False
+
+
+def _legality_violation(workspace: pathlib.Path, skill_root: pathlib.Path) -> str:
+    """MusaCoder/KernelBench legality gate: a solution that never touches NineToothed,
+    or that reaches for a banned torch/aten fallback (matmul/conv/reduction/attention),
+    has not completed the task even if its output happens to be numerically correct.
+    Returns a reason string, or "" if legal."""
+    if not _uses_ninetoothed(workspace):
+        return "solution does not use NineToothed (no import+make)"
+    banned = _banned_fallback_hits(workspace, skill_root)
+    if banned:
+        return f"banned aten/torch fallback used — {banned[0]}"
+    return ""
+
+
+def _banned_fallback_hits(workspace: pathlib.Path, skill_root: pathlib.Path) -> list[str]:
+    guard = _load_reward_hacking_guard(skill_root)
+    if guard is None:
+        return []
+    hits: list[str] = []
+    for p in _python_files(workspace):
+        if p.name == "oracle_test.py":
+            continue
+        try:
+            hits.extend(guard.banned_fallback_analysis(source_code=p.read_text(
+                encoding="utf-8", errors="ignore")))
+        except Exception:  # noqa: BLE001  (guard is best-effort)
+            continue
+    return hits
+
+
+def _load_reward_hacking_guard(skill_root: pathlib.Path):
+    try:
+        sys.path.insert(0, str(skill_root / "evaluation"))
+        from skill_eval import reward_hacking_guard  # type: ignore
+        return reward_hacking_guard
+    except Exception:  # noqa: BLE001  (guard is best-effort)
+        return None
 
 
 def _score_completion_diagnosis(workspace: pathlib.Path, task_meta: dict) -> tuple[SubScore, float, str]:
@@ -238,13 +280,28 @@ def _score_completion_diagnosis(workspace: pathlib.Path, task_meta: dict) -> tup
     return SubScore(val, 4, f"diagnosis hit {hit}/{len(findings)} expected findings"), frac, detail
 
 
+_CJK = r"一-鿿"
+
+
 def _finding_hit(finding: str, text: str) -> bool:
-    # a finding counts as hit if the majority of its salient keywords appear
-    keys = [w for w in re.split(r"[^a-z0-9_]+", finding) if len(w) > 3]
-    if not keys:
-        return finding in text
-    hits = sum(1 for k in keys if k in text)
-    return hits >= max(1, len(keys) // 2)
+    """Robust to mixed Chinese/ASCII findings. A finding is 'covered' when enough of its
+    salient tokens appear in the diagnosis: discriminative ASCII/technical tokens
+    (fp16, exp, num_warps, gb/s, contiguous, .ninetoothed) plus Chinese 2-grams. ASCII
+    tech tokens are weighted double since they are the strongest signal."""
+    t = text.lower()
+    f = finding.lower()
+    ascii_tokens = [w for w in re.findall(r"[a-z0-9_./%]{2,}", f) if w not in _STOP]
+    cjk_bigrams = []
+    for seg in re.findall(rf"[{_CJK}]+", finding):
+        cjk_bigrams += [seg[i:i + 2] for i in range(len(seg) - 1)]
+    if not ascii_tokens and not cjk_bigrams:
+        return f in t
+    score = sum(2 for k in ascii_tokens if k in t) + sum(1 for k in set(cjk_bigrams) if k in text)
+    need = max(2, int(0.4 * (2 * len(ascii_tokens) + len(set(cjk_bigrams)))))
+    return score >= need
+
+
+_STOP = {"the", "and", "for", "with", "use", "you", "are", "can"}
 
 
 def score_test(completion_frac: float, workspace: pathlib.Path, out_dir: pathlib.Path,
@@ -343,16 +400,21 @@ def score_compliance(workspace: pathlib.Path, skill_root: pathlib.Path,
     if generated_source is not None and generated_source.exists():
         static_reasons = _try_static_guard(generated_source, skill_root)
         reasons.extend(static_reasons)
+    # legality gate: banned torch/aten matmul-conv-reduction fallback anywhere in the
+    # solution (MusaCoder/KernelBench convention — also caps completion, see
+    # score_completion / _legality_violation; a hit here docks compliance too).
+    reasons.extend(_banned_fallback_hits(workspace, skill_root))
     if reasons:
         return SubScore(0, 1, "; ".join(reasons[:4]))
     return SubScore(1, 1, "no eval/exec/network; static guard clean")
 
 
 def _try_static_guard(generated_source: pathlib.Path, skill_root: pathlib.Path) -> list[str]:
+    guard = _load_reward_hacking_guard(skill_root)
+    if guard is None:
+        return []
     try:
-        sys.path.insert(0, str(skill_root / "evaluation"))
-        from skill_eval.reward_hacking_guard import static_analysis  # type: ignore
-        flags = static_analysis(source_path=generated_source)
+        flags = guard.static_analysis(source_path=generated_source)
         return [f"reward-hacking: {f}" for f in (flags or [])]
     except Exception:  # noqa: BLE001  (guard is best-effort)
         return []

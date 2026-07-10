@@ -50,6 +50,15 @@ _SYSTEM = (
 _FILE_RE = re.compile(r"===\s*FILE:\s*([A-Za-z0-9_./-]+)\s*===\s*\n```(?:python)?\s*\n(.*?)```",
                       re.DOTALL)
 
+_SYSTEM_DIAG = (
+    "You are diagnosing a NineToothed GPU-kernel problem. Use the provided skill guidance "
+    "(Roofline method, fp16/fp32 accumulation, generated-source inspection, num_warps/"
+    "num_stages, layout/contiguity). Output EXACTLY ONE file:\n"
+    "=== FILE: diagnosis.md ===\n```\n<markdown>\n```\n\n"
+    "List every root cause AND its concrete fix as explicit bullets. Be specific and use "
+    "the exact NineToothed terms from the guidance. Do not read files; everything is here."
+)
+
 # task family -> the single most relevant reference to inline (keeps context tight)
 _FAMILY_REF = {
     "elementwise": "elementwise.md", "reduction": "reduction.md",
@@ -93,16 +102,26 @@ def _read_skill_context(ws: pathlib.Path, prompt: str, budget_chars: int = 12000
 def _load(model_dir: str):
     if model_dir in _MODEL_CACHE:
         return _MODEL_CACHE[model_dir]
+    import os
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(model_dir)
-    # transformers 5.x renamed torch_dtype -> dtype; try new kw first, fall back.
+    kw = {"device_map": "cuda"}
+    # NT_QUANT=4bit -> load in bitsandbytes nf4 (lets a 14B/larger model fit in 32GB and
+    # leaves room for the ninetoothed compile subprocess). Verified on Blackwell sm_120.
+    if os.environ.get("NT_QUANT") == "4bit":
+        from transformers import BitsAndBytesConfig
+        kw["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True)
+    else:
+        kw["dtype"] = torch.bfloat16
     try:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir, dtype=torch.bfloat16, device_map="cuda")
+        model = AutoModelForCausalLM.from_pretrained(model_dir, **kw)
     except TypeError:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir, torch_dtype=torch.bfloat16, device_map="cuda")
+        kw.pop("dtype", None)
+        kw["torch_dtype"] = torch.bfloat16
+        model = AutoModelForCausalLM.from_pretrained(model_dir, **kw)
     model.eval()
     _MODEL_CACHE[model_dir] = (tok, model)
     return tok, model
@@ -142,7 +161,7 @@ def _write_files(text: str, ws: pathlib.Path) -> list[str]:
         it = iter(parts[1:])
         for name, body in zip(it, it):
             name = name.strip().split("/")[-1]
-            if not (name.endswith(".py") or name.endswith(".csv")):
+            if not (name.endswith(".py") or name.endswith(".csv") or name.endswith(".md")):
                 continue
             code = _strip_fences(body)
             if code:
@@ -245,23 +264,35 @@ def make_qwen_solver(model_dir: str, max_new_tokens: int = 3072, repair_rounds: 
     def _solver(prompt: str, ws: pathlib.Path, opts: dict) -> SolverResult:
         tok, model = _load(model_dir)
         t0 = time.time()
+        is_operator = opts.get("kind", "operator") == "operator"
+        system = _SYSTEM if is_operator else _SYSTEM_DIAG
         # inline skill text (with-skill modes) — a plain LM cannot open files itself
         skill_ctx = _read_skill_context(ws, prompt)
         user = prompt if not skill_ctx else (
             "Use the following skill guidance verbatim (API, workflow, pitfalls):\n\n"
             + skill_ctx + "\n\n---\n\n" + prompt)
-        messages = [{"role": "system", "content": _SYSTEM},
+        messages = [{"role": "system", "content": system},
                     {"role": "user", "content": user}]
         tin = tout = 0
         text, a, b = _generate(tok, model, messages, max_new_tokens)
         tin += a; tout += b
         _write_files(text, ws)
 
+        # diagnosis tasks have no code to run — ensure diagnosis.md exists (the model may
+        # not follow the === FILE === format for prose), then return.
+        if not is_operator:
+            dm = ws / "diagnosis.md"
+            if not dm.exists() or not dm.read_text(encoding="utf-8").strip():
+                body = _strip_fences(text) if ("```" in text or "=== FILE" in text) else text
+                dm.write_text(body.strip() + "\n", encoding="utf-8")
+            return SolverResult(tokens_in=tin, tokens_out=tout,
+                                wall_seconds=time.time() - t0, gpu_seconds=time.time() - t0,
+                                compiled=True, compile_attempts=1)
+
         # verification signal for the repair loop: prefer actually running solve() on the
         # task's real inputs (catches missing imports/shape/runtime bugs); fall back to import.
         task_id = opts.get("task_id")
         ptd = opts.get("proxy_tasks_dir")
-        is_operator = opts.get("kind", "operator") == "operator"
 
         def _check():
             if is_operator and task_id and ptd:

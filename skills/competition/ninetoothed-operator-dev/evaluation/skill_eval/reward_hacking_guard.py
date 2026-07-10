@@ -1,5 +1,6 @@
 """
-reward_hacking_guard.py — KernelSwift-inspired static + dynamic analysis.
+reward_hacking_guard.py — KernelSwift-inspired static + dynamic analysis,
+plus a MusaCoder/KernelBench-style legality (anti-cheat) guard.
 
 KernelSwift (Shanghai AI Lab) identifies three techniques for detecting
 kernels that appear faster than they should be:
@@ -21,6 +22,16 @@ Dynamic checks (runtime, no GPU profiler required):
   - Output shape mismatch (returned wrong buffer)
   - Output dtype mismatch
   - Output is identical to input (no-op)
+
+Legality (anti-cheat) check — see `banned_fallback_analysis` below — is a
+fourth, independent technique borrowed from KernelBench's task contract
+(`ModelNew.forward()` must not fall back to the reference op) and MusaCoder's
+MooreEval sandbox (静态分析 + 运行时 profiling 检测被禁 `aten::*`，命中即零奖励):
+a solution that reaches for a high-level PyTorch/aten matmul, conv, or
+reduction call instead of driving the NineToothed kernel can pass the
+numeric-correctness oracle without ever exercising the kernel it was asked
+to write. This module only implements the static half (AST scan); there is
+no dynamic/profiler-based confirmation, unlike KernelSwift checks 1–2 above.
 """
 from __future__ import annotations
 
@@ -36,21 +47,25 @@ class HackingReport:
     static_flags: list[str] = field(default_factory=list)
     dynamic_flags: list[str] = field(default_factory=list)
     ncu_flags: list[str] = field(default_factory=list)
+    legality_flags: list[str] = field(default_factory=list)
 
     @property
     def is_clean(self) -> bool:
-        return not (self.static_flags or self.dynamic_flags or self.ncu_flags)
+        return not (self.static_flags or self.dynamic_flags or self.ncu_flags
+                    or self.legality_flags)
 
     def __str__(self) -> str:
         if self.is_clean:
             return "reward_hacking: CLEAN"
         lines = ["reward_hacking: SUSPICIOUS"]
         for f in self.static_flags:
-            lines.append(f"  [static]  {f}")
+            lines.append(f"  [static]   {f}")
         for f in self.dynamic_flags:
-            lines.append(f"  [dynamic] {f}")
+            lines.append(f"  [dynamic]  {f}")
         for f in self.ncu_flags:
-            lines.append(f"  [ncu]     {f}")
+            lines.append(f"  [ncu]      {f}")
+        for f in self.legality_flags:
+            lines.append(f"  [legality] {f}")
         return "\n".join(lines)
 
 
@@ -255,6 +270,86 @@ def ncu_roofline_check(
 
 
 # ---------------------------------------------------------------------------
+# 4. Legality guard — banned high-level fallback ops
+#    (MusaCoder/KernelBench convention: matmul/conv/reduction/normalization
+#    must go through the NineToothed kernel under test, not a PyTorch/aten
+#    fallback that would make correctness pass for the wrong reason.)
+# ---------------------------------------------------------------------------
+
+# High-level compute ops that would let a solution pass correctness without
+# ever invoking a NineToothed kernel. Mirrors MusaCoder's aten::* ban (matmul/
+# conv/reduce family all banned); shape query, view/reshape, copy, and tensor
+# creation stay legal (musacoder.md: "白名单仅放行非计算工具").
+BANNED_FALLBACK_OPS = {
+    # matmul family
+    "matmul", "mm", "bmm", "addmm", "baddbmm", "einsum",
+    # conv family
+    "conv1d", "conv2d", "conv3d",
+    "conv_transpose1d", "conv_transpose2d", "conv_transpose3d",
+    # reduction family
+    "sum", "mean", "prod", "amax", "amin", "var", "std",
+    "cumsum", "cumprod", "logsumexp", "norm",
+    # fused high-level ops that would trivially satisfy correctness
+    "softmax", "log_softmax", "layer_norm", "batch_norm",
+    "scaled_dot_product_attention", "linear",
+}
+
+# NineToothed's own kernel DSL is accessed as `ntl.sum(...)` /
+# `ninetoothed.language.sum(...)` inside a kernel's `application()` (see any
+# examples/*/kernel.py) — that is the REQUIRED in-kernel form of a reduction,
+# not a fallback, so calls qualified by these names are never flagged.
+_NT_DSL_QUALIFIERS = ("ntl", "ninetoothed")
+
+
+class _LegalityAnalyzer(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.hits: list[str] = []
+
+    def visit_Call(self, node: ast.Call) -> None:
+        dotted = _dotted(node.func)
+        if dotted and "." in dotted:
+            qualifier, _, leaf = dotted.rpartition(".")
+            if leaf in BANNED_FALLBACK_OPS and not (
+                qualifier == "ntl" or qualifier.split(".")[0] in _NT_DSL_QUALIFIERS
+            ):
+                self.hits.append(f"{dotted}(...) at line {node.lineno}")
+        self.generic_visit(node)
+
+    def visit_BinOp(self, node: ast.BinOp) -> None:
+        if isinstance(node.op, ast.MatMult):
+            self.hits.append(f"'@' matmul operator at line {node.lineno}")
+        self.generic_visit(node)
+
+
+def banned_fallback_analysis(source_path: Optional[pathlib.Path] = None,
+                             source_code: Optional[str] = None) -> list[str]:
+    """
+    Scan solution source for banned high-level fallback ops (matmul/conv/
+    reduction/normalization/attention), mirroring MusaCoder/KernelBench's
+    `aten::*` ban and its "命中即零奖励" (a hit zeroes the reward) verdict.
+
+    Heuristic and AST-based, in the same spirit as static_analysis() above —
+    no type inference, so a bare `x.sum(...)` is flagged regardless of what
+    `x` actually is. The one deliberate exception is the `ntl.*` /
+    `ninetoothed.*` namespace, which is how a legitimate in-kernel reduction
+    is written and must never be flagged.
+
+    Returns a list of flag strings (empty = clean / legal).
+    """
+    if source_path is not None:
+        source_code = pathlib.Path(source_path).read_text(encoding="utf-8")
+    if not source_code:
+        return []
+    try:
+        tree = ast.parse(source_code)
+    except SyntaxError as e:
+        return [f"syntax_error: {e}"]
+    a = _LegalityAnalyzer()
+    a.visit(tree)
+    return [f"banned_fallback: {h}" for h in a.hits]
+
+
+# ---------------------------------------------------------------------------
 # Full guard: combine all three checks
 # ---------------------------------------------------------------------------
 
@@ -263,16 +358,23 @@ def full_guard(
     output_tensor,
     input_tensor=None,
     generated_source_path: Optional[pathlib.Path] = None,
+    solution_source_paths: Optional[list[pathlib.Path]] = None,
     bytes_moved: int = 0,
     flops: int = 0,
     gpu: str = "H100",
     run_ncu: bool = False,
 ) -> HackingReport:
     """
-    Run all reward-hacking checks and return a HackingReport.
+    Run all reward-hacking + legality checks and return a HackingReport.
 
     Intended to be called once after correctness validation and before
     submitting benchmark results to the evaluator.
+
+    Args:
+        solution_source_paths: the agent-produced .py files (e.g. kernel.py,
+            wrapper.py) to scan for banned `aten::*`-style fallback ops. Pass
+            all of them — the fallback is as likely to hide in the wrapper as
+            in the kernel itself.
     """
     report = HackingReport()
 
@@ -285,5 +387,8 @@ def full_guard(
 
     if run_ncu and bytes_moved > 0 and flops > 0:
         report.ncu_flags = ncu_roofline_check(kernel_fn, flops, bytes_moved, gpu)
+
+    for p in solution_source_paths or []:
+        report.legality_flags.extend(banned_fallback_analysis(source_path=p))
 
     return report
