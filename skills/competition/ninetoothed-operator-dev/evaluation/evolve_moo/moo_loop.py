@@ -253,11 +253,10 @@ def main(argv=None) -> int:
     else:
         from run_episode import resolve_solver
         solver = resolve_solver(args.solver, args.model_dir)
-        if args.solver == "qwen":
-            from qwen_solver import make_qwen_drafter
-            drafter = make_qwen_drafter(args.model_dir)
-        else:
-            drafter = llm_drafter
+        # template_drafter embeds the classifier's PRECISE repair hint (e.g. the exact
+        # positional-launch fix); the local 7B drafter tends to write vague guidance, so
+        # the deterministic template is the better drafter for a weak local model.
+        drafter = template_drafter if args.solver == "qwen" else llm_drafter
     result = run_loop(skill_root, out_dir, args.journal, cfg, solver=solver,
                       drafter=drafter, mode=args.mode)
     print(json.dumps(result, ensure_ascii=False, indent=2))

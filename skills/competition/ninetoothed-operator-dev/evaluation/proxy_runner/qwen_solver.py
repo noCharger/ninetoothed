@@ -175,9 +175,11 @@ def _import_ok(ws: pathlib.Path) -> tuple[bool, str]:
 
 
 def _solve_runs(ws: pathlib.Path, task_id: str, proxy_tasks_dir: str) -> tuple[bool, str]:
-    """Actually call solve() on the task's real inputs in a subprocess. Catches missing
-    imports, wrong signature, and shape/runtime errors that a bare import misses — this
-    is the repair signal that makes a weak model converge."""
+    """Run solve() on the task's real inputs AND check numerical correctness against the
+    reference. Returns (ok, err). This is the repair signal: it catches crashes (missing
+    imports, wrong signature/shape) AND wrong-output kernels (MERE too high), so the model
+    can iterate to a correct kernel — legitimate test-driven refinement, the same signal a
+    human kernel author uses. The final grade still comes from the independent oracle."""
     if not (ws / "wrapper.py").exists():
         return False, "no wrapper.py produced"
     check = (
@@ -187,14 +189,22 @@ def _solve_runs(ws: pathlib.Path, task_id: str, proxy_tasks_dir: str) -> tuple[b
         "t=[x for x in load_all() if x.id==%r][0]\n"
         "from wrapper import solve\n"
         "ins=t.make_inputs(device='cuda', dtype='float32')\n"
+        "ref=t.reference(*[x.clone() for x in ins])\n"
         "out=solve(*[x.clone() for x in ins])\n"
         "assert torch.is_tensor(out), 'solve did not return a tensor'\n"
-        "print('SOLVE_OK', tuple(out.shape))\n"
+        "assert out.shape==ref.shape, f'shape {tuple(out.shape)} != ref {tuple(ref.shape)}'\n"
+        "rel=(out.float()-ref.float()).abs()/(ref.float().abs()+1e-8)\n"
+        "mere=rel.mean().item()\n"
+        "print('SOLVE_OK' if mere < 1e-3 else f'SOLVE_WRONG mere={mere:.3e}', tuple(out.shape))\n"
     ) % (proxy_tasks_dir, task_id)
     proc = subprocess.run([sys.executable, "-c", check], cwd=str(ws),
                           capture_output=True, text=True, timeout=300)
     if proc.returncode == 0 and "SOLVE_OK" in proc.stdout:
         return True, ""
+    if "SOLVE_WRONG" in proc.stdout:
+        return False, ("kernel runs but output is numerically WRONG vs the reference: "
+                       + proc.stdout.strip().splitlines()[-1]
+                       + " — the computation/tiling is incorrect, not a crash.")
     return False, (proc.stderr or proc.stdout)[-900:]
 
 
@@ -228,7 +238,7 @@ def make_qwen_drafter(model_dir: str):
     return _drafter
 
 
-def make_qwen_solver(model_dir: str, max_new_tokens: int = 3072, repair_rounds: int = 2):
+def make_qwen_solver(model_dir: str, max_new_tokens: int = 3072, repair_rounds: int = 3):
     """Return a Solver closure: (prompt, ws, opts) -> SolverResult. Loads model once."""
     from run_episode import SolverResult   # local import to avoid cycle at module load
 
