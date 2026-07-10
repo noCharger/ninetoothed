@@ -53,6 +53,12 @@ _ALLOWED_EDIT_BASENAMES = {
     "matrix.csv", "generated_source.txt", "diagnosis.md",
 }
 
+# the subset of _ALLOWED_EDIT_BASENAMES that is actual *implementation* (as opposed
+# to a test/bench/notes artifact). The legality gate (_banned_fallback_hits) only
+# scans these: test_correctness.py legitimately computes a torch reference value to
+# assert against, and flagging that would be a false positive, not a real cheat.
+_SOLUTION_BASENAMES = {"kernel.py", "kernel_fixed.py", "wrapper.py"}
+
 _NETWORK_TOKENS = ("socket", "urllib", "requests", "http.client", "httpx", "aiohttp")
 
 
@@ -248,7 +254,7 @@ def _banned_fallback_hits(workspace: pathlib.Path, skill_root: pathlib.Path) -> 
         return []
     hits: list[str] = []
     for p in _python_files(workspace):
-        if p.name == "oracle_test.py":
+        if p.name not in _SOLUTION_BASENAMES:
             continue
         try:
             hits.extend(guard.banned_fallback_analysis(source_code=p.read_text(

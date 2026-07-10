@@ -30,6 +30,26 @@ All external material this `.skill` relies on, disclosed per rules §11 / §6.
   v0; experimental only).
 - **Anthropic Agent Skills** — `docs.claude.com/en/docs/agents-and-tools/agent-skills`
   — package layout, progressive disclosure, scripts-for-determinism.
+- **KernelSwift** (Shanghai AI Lab) — three-technique reward-hacking detection
+  (static AST analysis / dynamic runtime analysis / NCU roofline sanity check).
+  → `evaluation/skill_eval/reward_hacking_guard.py` implements technique 1 and 2
+  (no root/profiling access for NCU); `evaluation/skill_eval/robust_bench.py`'s
+  outlier-removal + bandwidth-sanity check borrows the same paper's fixed-graph
+  and IQR-outlier-removal measurement protocol.
+- **KernelBench** (arXiv 2502.10517, Stanford Scaling Intelligence Lab) — the
+  `Model`/`ModelNew`/`get_inputs()` task contract and its three-gate grading
+  (compiles → `torch.allclose` correctness on random inputs → legality); v0.1's
+  speed-of-light / excessive-speedup anti-cheat additions. → motivates the
+  compile/correctness/legality gate mapping documented in `tests/verifier_spec.md`
+  ("Three-gate mapping"); this skill's task interface (`wrapper.py:solve()`)
+  differs from `ModelNew`, so only the grading *convention* is borrowed, not code.
+- **MusaCoder** (arXiv 2606.04847, Moore Threads AI) — bans `aten::*`/cuBLAS
+  high-level fallback (matmul/conv/reduce family) in generated kernels, detected
+  via static + runtime analysis in its MooreEval sandbox, "命中即零奖励" (a hit
+  zeroes the reward). → motivates `banned_fallback_analysis()` in
+  `evaluation/skill_eval/reward_hacking_guard.py` (static/AST half only — no
+  runtime/profiler confirmation) and its wiring into `rubric_scorer.py`'s
+  completion cap and compliance sub-score.
 
 ## Tooling
 
