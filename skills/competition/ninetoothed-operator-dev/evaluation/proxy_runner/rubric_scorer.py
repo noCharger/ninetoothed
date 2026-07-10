@@ -246,9 +246,17 @@ def score_completion(workspace: pathlib.Path, task_meta: dict, skill_root: pathl
     return SubScore(val, 4, reason), frac, detail
 
 
+# NineToothed has TWO legitimate kernel-construction idioms, both used in the real
+# project's own test suite: `ninetoothed.make(arrangement, application, tensors)` (the
+# majority style, ~13/15 real tests) and the `@ninetoothed.jit` / `@jit` decorator (the
+# style tests/test_add.py itself uses — a repo-aware agent imitating that canonical
+# example will legitimately produce this, not the make() form).
+_KERNEL_BUILD_RE = re.compile(r"\bmake\s*\(|@(ninetoothed\.)?jit\b")
+
+
 def _uses_ninetoothed(workspace: pathlib.Path,
                       files: Optional[list[pathlib.Path]] = None) -> bool:
-    """True if the produced code genuinely builds a NineToothed kernel (import + make).
+    """True if the produced code genuinely builds a NineToothed kernel (make() or @jit).
 
     `files` restricts the scan to exactly these paths (repo-aware mode: the agent's diff,
     not the whole repo tree — src/ninetoothed/make.py itself would trivially match
@@ -260,7 +268,7 @@ def _uses_ninetoothed(workspace: pathlib.Path,
         if not p.exists():
             continue
         src = p.read_text(encoding="utf-8", errors="ignore")
-        if "ninetoothed" in src and re.search(r"\bmake\s*\(", src):
+        if "ninetoothed" in src and _KERNEL_BUILD_RE.search(src):
             return True
     return False
 
