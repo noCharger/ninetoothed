@@ -110,7 +110,9 @@ def _run_correctness_matrix(test_file: pathlib.Path, matrix_csv: pathlib.Path,
         return 0.0, f"run_correctness_matrix.py not found at {script}"
     if not test_file.exists():
         return 0.0, "no test file produced"
-    cmd = [sys.executable, str(script), str(test_file), "--csv", str(matrix_csv)]
+    # NOTE: run_correctness_matrix uses argparse.REMAINDER, so --csv MUST precede the
+    # positional test file, else it is swallowed as a pytest arg.
+    cmd = [sys.executable, str(script), "--csv", str(matrix_csv), str(test_file)]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
                               cwd=str(test_file.parent))
@@ -168,9 +170,11 @@ def score_completion(workspace: pathlib.Path, task_meta: dict, skill_root: pathl
     kind = task_meta.get("kind", "operator")
     if kind == "diagnosis":
         return _score_completion_diagnosis(workspace, task_meta)
-    test_file = _find(workspace, "test_correctness.py", f"test_{task_meta.get('name','')}.py")
+    # Prefer the harness-supplied oracle test (tamper-proof) over the agent's own test.
+    test_file = _find(workspace, "oracle_test.py") or \
+        _find(workspace, "test_correctness.py", f"test_{task_meta.get('name','')}.py")
     if test_file is None:
-        return SubScore(0, 4, "no test_correctness.py produced"), 0.0
+        return SubScore(0, 4, "no oracle/test file present"), 0.0
     matrix_csv = out_dir / f"matrix_{task_meta['id']}_{workspace.name}.csv"
     frac, reason = _run_correctness_matrix(test_file, matrix_csv, skill_root)
     # map fraction -> 0..4 : full=4, partial 1..3, none=0

@@ -31,7 +31,7 @@ _HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parent / "journal"))
 
-from run_episode import run_episode, make_fake_solver  # noqa: E402
+from run_episode import run_episode, make_fake_solver, resolve_solver  # noqa: E402
 from journal import Journal, GenerationRecord, rubric_total  # noqa: E402
 
 
@@ -54,14 +54,14 @@ def load_tasks(manifest: pathlib.Path, split: str) -> list[dict]:
 
 def run_matrix(skill_root, manifest, split, modes, out_dir, run_id, generation,
                journal_path=None, csv_path=None, fake=False, dry_run=False,
-               limit=None):
+               limit=None, solver_name="claude", model_dir=None):
     skill_root = pathlib.Path(skill_root)
     out_dir = pathlib.Path(out_dir)
     tasks = load_tasks(pathlib.Path(manifest), split)
     if limit:
         tasks = tasks[:limit]
     jnl = Journal(journal_path) if journal_path else None
-    solver = make_fake_solver(_FAKE_FILES) if fake else None
+    solver = make_fake_solver(_FAKE_FILES) if fake else resolve_solver(solver_name, model_dir)
 
     rows = []
     per_mode_total: dict[str, int] = {m: 0 for m in modes}
@@ -143,6 +143,8 @@ def main(argv=None) -> int:
     p.add_argument("--journal", default=None)
     p.add_argument("--csv", default=None)
     p.add_argument("--fake", action="store_true", help="offline stub solver (no claude)")
+    p.add_argument("--solver", default="claude", choices=["claude", "qwen", "fake"])
+    p.add_argument("--model-dir", default=None, help="local model dir for --solver qwen")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--limit", type=int, default=None)
     args = p.parse_args(argv)
@@ -151,7 +153,8 @@ def main(argv=None) -> int:
     manifest = args.manifest or skill_root / "evaluation" / "proxy_tasks" / "manifest.json"
     out_dir = args.out_dir or skill_root / "evaluation" / "results"
     run_matrix(skill_root, manifest, args.split, args.modes, out_dir, args.run_id,
-               args.generation, args.journal, args.csv, args.fake, args.dry_run, args.limit)
+               args.generation, args.journal, args.csv, args.fake, args.dry_run, args.limit,
+               solver_name=args.solver, model_dir=args.model_dir)
     return 0
 
 

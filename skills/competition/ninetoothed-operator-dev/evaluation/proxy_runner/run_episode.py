@@ -48,8 +48,9 @@ except Exception:  # pragma: no cover
 
 # what the agent is asked to produce, by task kind
 _OPERATOR_DELIVERABLES = (
-    "kernel.py (the NineToothed kernel), wrapper.py (the Python entry point), "
-    "and test_correctness.py (pytest cases across shapes and the task's dtypes). "
+    "kernel.py (the NineToothed kernel), wrapper.py, and test_correctness.py (pytest "
+    "cases across shapes and the task's dtypes). wrapper.py MUST expose "
+    "`def solve(*inputs)` returning the output tensor(s) — the grader calls solve(). "
     "If the task mentions performance, also emit bench.csv with >=3 input sizes and "
     "state a memory-bound / compute-bound verdict."
 )
@@ -133,6 +134,8 @@ def changed_files(ws: pathlib.Path) -> list[str]:
             continue
         if any(part.startswith("_") for part in rel.parts):   # harness artifacts
             continue
+        if rel.name in ("oracle_test.py",):                    # harness-supplied grader
+            continue
         out.append(str(rel))
     return out
 
@@ -175,6 +178,25 @@ def _parse_claude_json(stdout: str, wall: float) -> SolverResult:
     )
 
 
+def resolve_solver(name: str, model_dir: Optional[str] = None,
+                   fake_files: Optional[dict] = None) -> Optional[Solver]:
+    """Map a --solver name to a solver callable.
+    'claude' -> None (run_episode uses default_claude_solver);
+    'qwen'   -> local Qwen coder (needs --model-dir, torch+transformers on host);
+    'fake'   -> stub writer for offline wiring checks."""
+    if name == "claude":
+        return None
+    if name == "qwen":
+        if not model_dir:
+            raise SystemExit("--solver qwen requires --model-dir")
+        from qwen_solver import make_qwen_solver
+        return make_qwen_solver(model_dir)
+    if name == "fake":
+        from run_matrix import _FAKE_FILES
+        return make_fake_solver(fake_files or _FAKE_FILES)
+    raise SystemExit(f"unknown solver {name!r}")
+
+
 def make_fake_solver(files: dict, tokens=(3000, 1200), compiled=True) -> Solver:
     """Test/offline solver: writes given {relpath: content} into the sandbox."""
     def _solver(prompt: str, ws: pathlib.Path, opts: dict) -> SolverResult:
@@ -211,6 +233,14 @@ def run_episode(task_meta: dict, mode: str, skill_root: str | pathlib.Path,
 
     solver = solver or default_claude_solver
     sres = solver(prompt, ws, solver_opts or {})
+
+    # For operator tasks, drop in the harness oracle test so completion is tamper-proof.
+    if task_meta.get("kind", "operator") == "operator":
+        try:
+            from oracle import write_oracle_test
+            write_oracle_test(task_meta, ws, skill_root / "evaluation" / "proxy_tasks")
+        except Exception:  # noqa: BLE001  (oracle is best-effort; agent test is fallback)
+            pass
 
     tmeta = dict(task_meta, _mode=mode)
     rubric = score_episode(ws, tmeta, skill_root, out_dir / "rubric", changed_files(ws))
