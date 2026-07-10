@@ -232,7 +232,10 @@ def run_episode(task_meta: dict, mode: str, skill_root: str | pathlib.Path,
         return None, None
 
     solver = solver or default_claude_solver
-    sres = solver(prompt, ws, solver_opts or {})
+    opts = {**(solver_opts or {}), "task_id": task_meta["id"],
+            "kind": task_meta.get("kind", "operator"),
+            "proxy_tasks_dir": str(skill_root / "evaluation" / "proxy_tasks")}
+    sres = solver(prompt, ws, opts)
 
     # For operator tasks, drop in the harness oracle test so completion is tamper-proof.
     if task_meta.get("kind", "operator") == "operator":
@@ -290,6 +293,8 @@ def main(argv=None) -> int:
     p.add_argument("--run-id", default="adhoc")
     p.add_argument("--generation", type=int, default=0)
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--solver", default="claude", choices=["claude", "qwen", "fake"])
+    p.add_argument("--model-dir", default=None, help="local model dir for --solver qwen")
     p.add_argument("--journal", default=None, help="append the record to this JSONL journal")
     args = p.parse_args(argv)
 
@@ -298,9 +303,10 @@ def main(argv=None) -> int:
         skill_root / "evaluation" / "proxy_tasks" / "manifest.json"
     task_meta = _load_task(manifest, args.task_id)
 
+    solver = resolve_solver(args.solver, args.model_dir) if not args.dry_run else None
     rec, rubric = run_episode(task_meta, args.mode, skill_root, args.out_dir,
                               run_id=args.run_id, generation=args.generation,
-                              dry_run=args.dry_run)
+                              solver=solver, dry_run=args.dry_run)
     if args.dry_run:
         return 0
     print(json.dumps(rubric.to_dict(), ensure_ascii=False, indent=2))

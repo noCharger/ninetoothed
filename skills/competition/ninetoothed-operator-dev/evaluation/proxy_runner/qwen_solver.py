@@ -34,20 +34,60 @@ _MODEL_CACHE: dict = {}
 
 _SYSTEM = (
     "You are a GPU kernel engineer writing NineToothed operators. NineToothed is a "
-    "tile-based Python DSL: you define an `arrangement(*tensors)` returning tiled views "
-    "and an `application(*tiles)` computing on them, then `ninetoothed.make(arrangement, "
-    "application, tensors)` compiles a kernel. Follow the provided skill references "
-    "exactly for API and pitfalls. Output ONLY the requested files, each in its own block:\n"
-    "=== FILE: wrapper.py ===\n```python\n<code>\n```\n"
-    "=== FILE: kernel.py ===\n```python\n<code>\n```\n"
-    "=== FILE: test_correctness.py ===\n```python\n<code>\n```\n"
-    "Use ABSOLUTE imports (the files sit flat in one dir): `from wrapper import solve`. "
-    "wrapper.py MUST expose `def solve(*inputs)` returning the output tensor — the grader "
-    "calls solve(). The test must use pytest and skip if CUDA is unavailable."
+    "tile-based Python DSL: define `arrangement(*tensors)` returning tiled views (via "
+    "`tensor.tile((BLOCK_SIZE,))`) and `application(*tiles)` computing on them, then "
+    "`kernel = ninetoothed.make(arrangement, application, tuple(Tensor(ndim) for ...))` "
+    "compiles it; call `kernel(*tensors, BLOCK_SIZE=...)` writing into a preallocated "
+    "output. Follow the provided skill guidance exactly for API and pitfalls.\n\n"
+    "Output EXACTLY ONE self-contained file — no separate kernel module, no test:\n"
+    "=== FILE: wrapper.py ===\n```python\n<all code here>\n```\n\n"
+    "wrapper.py MUST import ninetoothed, define the kernel inline, and expose "
+    "`def solve(*inputs)` that allocates the output, launches the kernel, and RETURNS the "
+    "output tensor. The grader imports and calls solve(). Do not read files; everything "
+    "you need is in this message."
 )
 
 _FILE_RE = re.compile(r"===\s*FILE:\s*([A-Za-z0-9_./-]+)\s*===\s*\n```(?:python)?\s*\n(.*?)```",
                       re.DOTALL)
+
+# task family -> the single most relevant reference to inline (keeps context tight)
+_FAMILY_REF = {
+    "elementwise": "elementwise.md", "reduction": "reduction.md",
+    "layout": "layout.md", "perf_diag": "perf-diag.md", "perf-diag": "perf-diag.md",
+}
+
+
+def _read_skill_context(ws: pathlib.Path, prompt: str, budget_chars: int = 12000) -> str:
+    """Inline the skill text into the prompt. A plain LM cannot read files, so with-skill
+    mode must hand it SKILL.md + the family-relevant reference verbatim. Returns "" when no
+    skill/ was seeded (no_skill mode) — that is exactly the A/B contrast we measure."""
+    skill = ws / "skill"
+    if not skill.is_dir():
+        return ""
+    parts = []
+    sk = skill / "SKILL.md"
+    if sk.exists():
+        parts.append("=== SKILL.md ===\n" + sk.read_text(encoding="utf-8", errors="ignore"))
+    # pick the reference matching the family named in the prompt
+    fam = ""
+    m = re.search(r"Task \(([a-z_\-]+)", prompt)
+    if m:
+        fam = m.group(1)
+    ref_name = _FAMILY_REF.get(fam)
+    refs_dir = skill / "references"
+    chosen = []
+    if ref_name and (refs_dir / ref_name).exists():
+        chosen.append(refs_dir / ref_name)
+    # always include the common-errors + taxonomy if room allows
+    for extra in ("common-errors.md", "operator-taxonomy.md"):
+        p = refs_dir / extra
+        if p.exists():
+            chosen.append(p)
+    for p in chosen:
+        parts.append(f"=== references/{p.name} ===\n" +
+                     p.read_text(encoding="utf-8", errors="ignore"))
+    text = "\n\n".join(parts)
+    return text[:budget_chars]
 
 
 def _load(model_dir: str):
@@ -56,8 +96,13 @@ def _load(model_dir: str):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(model_dir)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_dir, torch_dtype=torch.bfloat16, device_map="cuda")
+    # transformers 5.x renamed torch_dtype -> dtype; try new kw first, fall back.
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir, dtype=torch.bfloat16, device_map="cuda")
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir, torch_dtype=torch.bfloat16, device_map="cuda")
     model.eval()
     _MODEL_CACHE[model_dir] = (tok, model)
     return tok, model
@@ -104,32 +149,74 @@ def _import_ok(ws: pathlib.Path) -> tuple[bool, str]:
     return False, (proc.stderr or proc.stdout)[-800:]
 
 
-def make_qwen_solver(model_dir: str, max_new_tokens: int = 2048, repair_rounds: int = 1):
+def _solve_runs(ws: pathlib.Path, task_id: str, proxy_tasks_dir: str) -> tuple[bool, str]:
+    """Actually call solve() on the task's real inputs in a subprocess. Catches missing
+    imports, wrong signature, and shape/runtime errors that a bare import misses — this
+    is the repair signal that makes a weak model converge."""
+    if not (ws / "wrapper.py").exists():
+        return False, "no wrapper.py produced"
+    check = (
+        "import sys; sys.path.insert(0, %r); sys.path.insert(0, '.')\n"
+        "import torch\n"
+        "from loader import load_all\n"
+        "t=[x for x in load_all() if x.id==%r][0]\n"
+        "from wrapper import solve\n"
+        "ins=t.make_inputs(device='cuda', dtype='float32')\n"
+        "out=solve(*[x.clone() for x in ins])\n"
+        "assert torch.is_tensor(out), 'solve did not return a tensor'\n"
+        "print('SOLVE_OK', tuple(out.shape))\n"
+    ) % (proxy_tasks_dir, task_id)
+    proc = subprocess.run([sys.executable, "-c", check], cwd=str(ws),
+                          capture_output=True, text=True, timeout=300)
+    if proc.returncode == 0 and "SOLVE_OK" in proc.stdout:
+        return True, ""
+    return False, (proc.stderr or proc.stdout)[-900:]
+
+
+def make_qwen_solver(model_dir: str, max_new_tokens: int = 3072, repair_rounds: int = 2):
     """Return a Solver closure: (prompt, ws, opts) -> SolverResult. Loads model once."""
     from run_episode import SolverResult   # local import to avoid cycle at module load
 
     def _solver(prompt: str, ws: pathlib.Path, opts: dict) -> SolverResult:
         tok, model = _load(model_dir)
         t0 = time.time()
+        # inline skill text (with-skill modes) — a plain LM cannot open files itself
+        skill_ctx = _read_skill_context(ws, prompt)
+        user = prompt if not skill_ctx else (
+            "Use the following skill guidance verbatim (API, workflow, pitfalls):\n\n"
+            + skill_ctx + "\n\n---\n\n" + prompt)
         messages = [{"role": "system", "content": _SYSTEM},
-                    {"role": "user", "content": prompt}]
+                    {"role": "user", "content": user}]
         tin = tout = 0
         text, a, b = _generate(tok, model, messages, max_new_tokens)
         tin += a; tout += b
         _write_files(text, ws)
 
-        ok, err = _import_ok(ws)
+        # verification signal for the repair loop: prefer actually running solve() on the
+        # task's real inputs (catches missing imports/shape/runtime bugs); fall back to import.
+        task_id = opts.get("task_id")
+        ptd = opts.get("proxy_tasks_dir")
+        is_operator = opts.get("kind", "operator") == "operator"
+
+        def _check():
+            if is_operator and task_id and ptd:
+                return _solve_runs(ws, task_id, ptd)
+            return _import_ok(ws)
+
+        ok, err = _check()
         rounds = 0
         while not ok and rounds < repair_rounds:
             rounds += 1
             messages.append({"role": "assistant", "content": text})
             messages.append({"role": "user", "content":
-                             f"That failed to import with:\n{err}\n"
-                             "Fix it. Re-emit ALL files in the same === FILE: === format."})
+                             f"Your wrapper.py failed when the grader ran solve():\n{err}\n"
+                             "Fix it. Re-emit the COMPLETE wrapper.py in the "
+                             "=== FILE: wrapper.py === format. Remember `import torch` and "
+                             "any other imports you use."})
             text, a, b = _generate(tok, model, messages, max_new_tokens)
             tin += a; tout += b
             _write_files(text, ws)
-            ok, err = _import_ok(ws)
+            ok, err = _check()
 
         return SolverResult(tokens_in=tin, tokens_out=tout, wall_seconds=time.time() - t0,
                             gpu_seconds=time.time() - t0, compiled=ok,
