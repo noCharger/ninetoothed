@@ -115,25 +115,48 @@ def _generate(tok, model, messages: list[dict], max_new_tokens: int = 2048) -> t
     n_in = inputs.input_ids.shape[1]
     with torch.no_grad():
         out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=True,
-                             temperature=0.7, top_p=0.9, pad_token_id=tok.eos_token_id)
+                             temperature=0.2, top_p=0.9, pad_token_id=tok.eos_token_id)
     gen = out[0][n_in:]
     n_out = gen.shape[0]
     return tok.decode(gen, skip_special_tokens=True), n_in, int(n_out)
 
 
+_MARKER_RE = re.compile(r"===\s*FILE:\s*([A-Za-z0-9_./-]+)\s*===")
+
+
+def _strip_fences(s: str) -> str:
+    """Remove ```python / ``` fences and any stray === FILE: === marker lines."""
+    s = re.sub(r"```[a-zA-Z0-9_]*", "", s)
+    lines = [ln for ln in s.splitlines() if not _MARKER_RE.match(ln.strip())]
+    return "\n".join(lines).strip()
+
+
 def _write_files(text: str, ws: pathlib.Path) -> list[str]:
+    """Robust to models that emit FILE markers with OR without ```fences.
+    Splits on === FILE: name === markers, strips fences/markers from each body."""
     written = []
-    for name, body in _FILE_RE.findall(text):
-        name = name.strip().split("/")[-1]            # flatten any path
-        if not name.endswith(".py") and not name.endswith(".csv"):
-            continue
-        (ws / name).write_text(body.strip() + "\n", encoding="utf-8")
-        written.append(name)
-    # fallback: if the model emitted a single unlabelled python block, treat it as wrapper
+    parts = _MARKER_RE.split(text)        # [pre, name1, body1, name2, body2, ...]
+    if len(parts) >= 3:
+        it = iter(parts[1:])
+        for name, body in zip(it, it):
+            name = name.strip().split("/")[-1]
+            if not (name.endswith(".py") or name.endswith(".csv")):
+                continue
+            code = _strip_fences(body)
+            if code:
+                (ws / name).write_text(code + "\n", encoding="utf-8")
+                written.append(name)
+    # fallback 1: first fenced block -> wrapper.py
     if not written:
         m = re.search(r"```(?:python)?\s*\n(.*?)```", text, re.DOTALL)
         if m:
             (ws / "wrapper.py").write_text(m.group(1).strip() + "\n", encoding="utf-8")
+            written.append("wrapper.py")
+    # fallback 2: whole text (stripped) if it defines solve
+    if not written:
+        code = _strip_fences(text)
+        if "def solve" in code:
+            (ws / "wrapper.py").write_text(code + "\n", encoding="utf-8")
             written.append("wrapper.py")
     return written
 
@@ -227,11 +250,19 @@ def make_qwen_solver(model_dir: str, max_new_tokens: int = 3072, repair_rounds: 
 
 if __name__ == "__main__":
     # offline: verify the file-block parser without loading any model
+    import tempfile
+    # fenced
     demo = ("blah\n=== FILE: wrapper.py ===\n```python\nprint('w')\n```\n"
             "=== FILE: test_correctness.py ===\n```python\ndef test(): assert True\n```\n")
-    import tempfile
     ws = pathlib.Path(tempfile.mkdtemp())
     got = _write_files(demo, ws)
     assert set(got) == {"wrapper.py", "test_correctness.py"}, got
     assert (ws / "wrapper.py").read_text().strip() == "print('w')"
-    print("qwen_solver parser self-test OK:", got)
+    # UNFENCED marker (the bug that leaked the marker into wrapper.py)
+    demo2 = "=== FILE: wrapper.py ===\nimport torch\ndef solve(a):\n    return a\n"
+    ws2 = pathlib.Path(tempfile.mkdtemp())
+    got2 = _write_files(demo2, ws2)
+    body2 = (ws2 / "wrapper.py").read_text()
+    assert got2 == ["wrapper.py"] and "=== FILE" not in body2 and body2.startswith("import torch"), body2
+    compile(body2, "wrapper.py", "exec")   # must be valid python now
+    print("qwen_solver parser self-test OK (fenced + unfenced):", got, got2)

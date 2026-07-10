@@ -184,7 +184,24 @@ def score_completion(workspace: pathlib.Path, task_meta: dict, skill_root: pathl
         val = 0
     else:
         val = max(1, min(3, round(frac * 4)))
+    # The task is to implement a NineToothed operator. A correct-output solution that
+    # does NOT actually use the DSL (pure torch, or a hallucinated fake API) has not
+    # fulfilled the task — cap its completion so the skill's real-API value is what counts.
+    if val >= 2 and not _uses_ninetoothed(workspace):
+        val = 1
+        reason += " (capped: solution does not use NineToothed)"
     return SubScore(val, 4, reason), frac
+
+
+def _uses_ninetoothed(workspace: pathlib.Path) -> bool:
+    """True if the produced code genuinely builds a NineToothed kernel (import + make)."""
+    for p in _python_files(workspace):
+        if p.name == "oracle_test.py":
+            continue
+        src = p.read_text(encoding="utf-8", errors="ignore")
+        if "ninetoothed" in src and re.search(r"\bmake\s*\(", src):
+            return True
+    return False
 
 
 def _score_completion_diagnosis(workspace: pathlib.Path, task_meta: dict) -> tuple[SubScore, float]:
