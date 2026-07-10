@@ -25,9 +25,18 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import ssl
 import time
 import urllib.error
 import urllib.request
+
+# a verified SSL context that works across platforms (macOS python often lacks a system
+# CA bundle); fall back to certifi's bundle, then to the default context.
+try:
+    import certifi
+    _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
+except Exception:  # noqa: BLE001
+    _SSL_CTX = ssl.create_default_context()
 
 # reuse the stable solve-loop helpers from the local-model solver
 from qwen_solver import (                                   # noqa: E402
@@ -53,7 +62,7 @@ def _glm_chat(messages: list[dict], model: str, api_key: str, endpoint: str,
     last_err = ""
     for attempt in range(3):                                # simple retry on transient errors
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as r:
                 d = json.load(r)
             msg = d["choices"][0]["message"]
             content = msg.get("content") or ""              # ignore reasoning_content
@@ -126,6 +135,170 @@ def make_glm_solver(model: str | None = None, api_key: str | None = None,
         return SolverResult(tokens_in=tin, tokens_out=tout, wall_seconds=time.time() - t0,
                             gpu_seconds=0.0, compiled=ok, compile_attempts=rounds + 1,
                             raw={"import_ok": ok, "model": model})
+    return _solver
+
+
+# ===========================================================================
+# Agentic (tool-calling) GLM solver — GLM drives its own loop via function calls.
+# This is the "agent harness" form: instead of a scripted generate->parse->repair,
+# the model decides to write_file / run_test / read_file and iterates on real tool
+# results, like a coding agent. Much stronger for a capable model (GLM-4.6 / glm-5.2).
+# ===========================================================================
+
+_TOOLS_OPERATOR = [
+    {"type": "function", "function": {
+        "name": "write_file",
+        "description": "Write (overwrite) a file in the working directory.",
+        "parameters": {"type": "object", "properties": {
+            "filename": {"type": "string", "description": "e.g. wrapper.py"},
+            "content": {"type": "string"}}, "required": ["filename", "content"]}}},
+    {"type": "function", "function": {
+        "name": "run_test",
+        "description": "Run the grader: import wrapper.solve and check its output against "
+                       "the reference on real inputs. Returns PASS or the error/mismatch.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "read_file",
+        "description": "Read a file you previously wrote.",
+        "parameters": {"type": "object", "properties": {
+            "filename": {"type": "string"}}, "required": ["filename"]}}},
+]
+
+_TOOLS_DIAG = [
+    {"type": "function", "function": {
+        "name": "write_file",
+        "description": "Write your analysis to diagnosis.md.",
+        "parameters": {"type": "object", "properties": {
+            "filename": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["filename", "content"]}}},
+]
+
+_AGENT_SYSTEM_OP = (
+    "You are a GPU kernel engineer using NineToothed (a tile-based Python DSL: define "
+    "arrangement(*tensors) returning tiled views and application(*tiles); "
+    "kernel=ninetoothed.make(arrangement, application, tuple(Tensor(ndim) ...)); call "
+    "kernel(*tensors, BLOCK_SIZE=...) into a preallocated output). Follow the provided "
+    "skill guidance for API and pitfalls.\n\n"
+    "Work agentically with the tools: write a SINGLE self-contained wrapper.py that "
+    "imports ninetoothed + torch, defines the kernel inline, and exposes "
+    "`def solve(*inputs)` returning the output tensor. Then call run_test. If it fails, "
+    "read the error, fix wrapper.py, and run_test again. Stop when run_test returns PASS "
+    "(or after a few honest attempts). Do NOT fake correctness — the grader is independent."
+)
+_AGENT_SYSTEM_DIAG = (
+    "You are diagnosing a NineToothed GPU-kernel problem. Use the provided skill guidance "
+    "(Roofline, fp16/fp32 accumulation, generated-source inspection, num_warps/num_stages, "
+    "layout/contiguity). Call write_file once to write diagnosis.md listing every root "
+    "cause AND its concrete fix as explicit bullets, using the exact NineToothed terms."
+)
+
+
+def _glm_chat_tools(messages, model, api_key, endpoint, tools, max_tokens, timeout=180):
+    """One tool-enabled completion. Returns (assistant_message_dict, p_tok, c_tok)."""
+    body = json.dumps({"model": model, "messages": messages, "tools": tools,
+                       "temperature": 0.2, "max_tokens": max_tokens}).encode("utf-8")
+    req = urllib.request.Request(endpoint, data=body, method="POST",
+                                 headers={"Authorization": f"Bearer {api_key}",
+                                          "Content-Type": "application/json"})
+    last_err = ""
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as r:
+                d = json.load(r)
+            msg = d["choices"][0]["message"]
+            usage = d.get("usage", {}) or {}
+            return msg, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
+        except urllib.error.HTTPError as e:
+            last_err = f"HTTP {e.code}: {e.read()[:200].decode(errors='ignore')}"
+            if e.code in (400, 401, 403):
+                break
+        except Exception as e:  # noqa: BLE001
+            last_err = str(e)
+        time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"GLM tool chat failed: {last_err}")
+
+
+def _exec_tool(name, args, ws: pathlib.Path, task_id, ptd) -> str:
+    if name == "write_file":
+        fn = pathlib.Path(str(args.get("filename", "wrapper.py"))).name
+        (ws / fn).write_text(str(args.get("content", "")), encoding="utf-8")
+        return f"wrote {fn} ({len(args.get('content',''))} chars)"
+    if name == "read_file":
+        fn = pathlib.Path(str(args.get("filename", ""))).name
+        p = ws / fn
+        return p.read_text(encoding="utf-8")[:4000] if p.exists() else f"{fn} not found"
+    if name == "run_test":
+        if not task_id or not ptd:
+            return "run_test unavailable"
+        ok, err = _solve_runs(ws, task_id, ptd)
+        return "PASS" if ok else f"FAIL: {err}"
+    return f"unknown tool {name}"
+
+
+def make_glm_agent_solver(model=None, api_key=None, endpoint=None,
+                          max_new_tokens=4096, max_steps=8):
+    api_key = api_key or os.environ.get("GLM_API_KEY")
+    if not api_key:
+        raise SystemExit("--solver glm needs GLM_API_KEY")
+    model = model or os.environ.get("GLM_MODEL", "glm-4.6")
+    endpoint = endpoint or os.environ.get("GLM_ENDPOINT", _DEFAULT_ENDPOINT)
+
+    def _solver(prompt: str, ws: pathlib.Path, opts: dict) -> SolverResult:
+        t0 = time.time()
+        is_operator = opts.get("kind", "operator") == "operator"
+        task_id = opts.get("task_id"); ptd = opts.get("proxy_tasks_dir")
+        tools = _TOOLS_OPERATOR if is_operator else _TOOLS_DIAG
+        system = _AGENT_SYSTEM_OP if is_operator else _AGENT_SYSTEM_DIAG
+        skill_ctx = _read_skill_context(ws, prompt)
+        user = prompt if not skill_ctx else (
+            "Use the following skill guidance verbatim (API, workflow, pitfalls):\n\n"
+            + skill_ctx + "\n\n---\n\n" + prompt)
+        messages = [{"role": "system", "content": system},
+                    {"role": "user", "content": user}]
+        tin = tout = 0
+        passed = False
+        for _ in range(max_steps):
+            msg, a, b = _glm_chat_tools(messages, model, api_key, endpoint, tools, max_new_tokens)
+            tin += a; tout += b
+            tool_calls = msg.get("tool_calls") or []
+            # record the assistant turn (content may be null when only tool calls)
+            messages.append({"role": "assistant", "content": msg.get("content") or "",
+                             "tool_calls": tool_calls} if tool_calls
+                            else {"role": "assistant", "content": msg.get("content") or ""})
+            if not tool_calls:
+                break                          # model produced a final answer, no tools
+            for tc in tool_calls:
+                fn = tc["function"]["name"]
+                try:
+                    args = json.loads(tc["function"].get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                result = _exec_tool(fn, args, ws, task_id, ptd)
+                if fn == "run_test" and result == "PASS":
+                    passed = True
+                messages.append({"role": "tool", "tool_call_id": tc.get("id", ""),
+                                 "content": result[:2000]})
+            if passed:
+                break
+
+        # diagnosis: ensure diagnosis.md exists even if the model answered in plain text
+        if not is_operator:
+            dm = ws / "diagnosis.md"
+            if not dm.exists() or not dm.read_text(encoding="utf-8").strip():
+                last = next((m["content"] for m in reversed(messages)
+                             if m["role"] == "assistant" and m.get("content")), "")
+                dm.write_text((_strip_fences(last) if "```" in last else last).strip() + "\n",
+                              encoding="utf-8")
+            return SolverResult(tokens_in=tin, tokens_out=tout, wall_seconds=time.time() - t0,
+                                compiled=True, compile_attempts=1)
+
+        # operator: final correctness verdict (independent of the model's own claims)
+        if not passed:
+            ok, _ = _solve_runs(ws, task_id, ptd) if (task_id and ptd) else _import_ok(ws)
+            passed = ok
+        return SolverResult(tokens_in=tin, tokens_out=tout, wall_seconds=time.time() - t0,
+                            gpu_seconds=0.0, compiled=passed, compile_attempts=1,
+                            raw={"agentic": True, "model": model})
     return _solver
 
 

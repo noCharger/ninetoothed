@@ -193,8 +193,13 @@ def resolve_solver(name: str, model_dir: Optional[str] = None,
         from qwen_solver import make_qwen_solver
         return make_qwen_solver(model_dir)
     if name == "glm":
-        from glm_solver import make_glm_solver
-        return make_glm_solver()   # reads GLM_API_KEY / GLM_MODEL from env
+        # default to the agentic tool-calling solver (GLM drives write_file/run_test);
+        # GLM_AGENT=0 falls back to the scripted single-shot+repair solver.
+        if os.environ.get("GLM_AGENT", "1") == "0":
+            from glm_solver import make_glm_solver
+            return make_glm_solver()
+        from glm_solver import make_glm_agent_solver
+        return make_glm_agent_solver()
     if name == "fake":
         from run_matrix import _FAKE_FILES
         return make_fake_solver(fake_files or _FAKE_FILES)
