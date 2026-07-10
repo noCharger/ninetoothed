@@ -105,22 +105,31 @@ def attribute(failures: list[Failure], skill_root: str | pathlib.Path,
             "n_tasks": n_tasks,
             "matched_rule": clf0.matched_rule,
         }
-        if is_repeat and heading:
-            # promote the pitfall to the top of its section list, then sharpen it
-            proposals.append(EditProposal(
-                op="reorder", target_file=target_file, heading=heading,
-                before_heading=_first_section(skill_root, target_file, heading),
-                rationale=f"repeated symptom across {n_tasks} tasks: {clf0.repair_hint}",
-                source="attribution",
-            ))
-        new_body = drafter(skill_root, target_file, heading or "", context)
+        target_heading = heading or _fallback_heading(skill_root, target_file)
+        drafted = drafter(skill_root, target_file, target_heading, context)
+        # ADDITIVE edit: append the new guidance to the existing section body instead of
+        # replacing it. A weak drafter that overwrites a section can delete the specific,
+        # correct pitfalls already there (observed: generic fluff replacing the exact
+        # rank/tile fix). Appending preserves prior guidance and only adds.
+        current = _section_body(skill_root, target_file, target_heading)
+        new_body = (current.rstrip() + "\n\n" + drafted.strip()) if current else drafted.strip()
         proposals.append(EditProposal(
-            op="substitute", target_file=target_file, heading=heading or _fallback_heading(skill_root, target_file),
+            op="substitute", target_file=target_file, heading=target_heading,
             new_body=new_body,
             rationale=f"{n_tasks} task(s) hit: {clf0.repair_hint}",
             source="attribution+" + ("llm" if drafter is llm_drafter else "template"),
         ))
     return proposals
+
+
+def _section_body(skill_root: pathlib.Path, target_file: str, heading: str) -> str:
+    from edit_ops import MarkdownDoc
+    fp = skill_root / target_file
+    if not fp.exists() or not heading:
+        return ""
+    doc = MarkdownDoc.parse(fp.read_text(encoding="utf-8"))
+    i = doc.find(heading)
+    return "\n".join(doc.blocks[i].body) if i is not None else ""
 
 
 def _pick_heading(skill_root: pathlib.Path, target_file: str, clf) -> Optional[str]:

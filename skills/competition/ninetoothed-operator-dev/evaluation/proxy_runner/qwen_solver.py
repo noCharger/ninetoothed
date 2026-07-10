@@ -114,8 +114,10 @@ def _generate(tok, model, messages: list[dict], max_new_tokens: int = 2048) -> t
     inputs = tok([text], return_tensors="pt").to(model.device)
     n_in = inputs.input_ids.shape[1]
     with torch.no_grad():
-        out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=True,
-                             temperature=0.2, top_p=0.9, pad_token_id=tok.eos_token_id)
+        # greedy decoding: deterministic output for a given (skill, task) so the evolution
+        # loop's fitness is stable and the guard measures real edit effects, not sampling noise.
+        out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False,
+                             pad_token_id=tok.eos_token_id)
     gen = out[0][n_in:]
     n_out = gen.shape[0]
     return tok.decode(gen, skip_special_tokens=True), n_in, int(n_out)
