@@ -145,7 +145,7 @@ def main(argv=None) -> int:
     p.add_argument("--journal", default=None)
     p.add_argument("--csv", default=None)
     p.add_argument("--fake", action="store_true", help="offline stub solver (no claude)")
-    p.add_argument("--solver", default="claude", choices=["claude", "qwen", "fake"])
+    p.add_argument("--solver", default="claude", choices=["claude", "qwen", "glm", "fake"])
     p.add_argument("--model-dir", default=None, help="local model dir for --solver qwen")
     p.add_argument("--family", default=None, help="restrict to one operator family/category")
     p.add_argument("--dry-run", action="store_true")

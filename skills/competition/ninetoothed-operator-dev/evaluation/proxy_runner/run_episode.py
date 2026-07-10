@@ -183,6 +183,7 @@ def resolve_solver(name: str, model_dir: Optional[str] = None,
     """Map a --solver name to a solver callable.
     'claude' -> None (run_episode uses default_claude_solver);
     'qwen'   -> local Qwen coder (needs --model-dir, torch+transformers on host);
+    'glm'    -> hosted GLM over the Zhipu API (needs GLM_API_KEY; GLM_MODEL optional);
     'fake'   -> stub writer for offline wiring checks."""
     if name == "claude":
         return None
@@ -191,6 +192,9 @@ def resolve_solver(name: str, model_dir: Optional[str] = None,
             raise SystemExit("--solver qwen requires --model-dir")
         from qwen_solver import make_qwen_solver
         return make_qwen_solver(model_dir)
+    if name == "glm":
+        from glm_solver import make_glm_solver
+        return make_glm_solver()   # reads GLM_API_KEY / GLM_MODEL from env
     if name == "fake":
         from run_matrix import _FAKE_FILES
         return make_fake_solver(fake_files or _FAKE_FILES)
@@ -293,7 +297,7 @@ def main(argv=None) -> int:
     p.add_argument("--run-id", default="adhoc")
     p.add_argument("--generation", type=int, default=0)
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--solver", default="claude", choices=["claude", "qwen", "fake"])
+    p.add_argument("--solver", default="claude", choices=["claude", "qwen", "glm", "fake"])
     p.add_argument("--model-dir", default=None, help="local model dir for --solver qwen")
     p.add_argument("--journal", default=None, help="append the record to this JSONL journal")
     args = p.parse_args(argv)
