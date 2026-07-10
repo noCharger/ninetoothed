@@ -18,20 +18,26 @@
 #   SOLVER=qwen MODEL_DIR=... TAG=qwen7b BLOCKS="1 2" bash evaluation/run_comparison.sh
 #
 # Env:
-#   SOLVER    qwen|glm|fake                 (required)
-#   TAG       results label                 (required)
-#   SKILL_ROOT skill package root           (default: dir above this script)
-#   MODEL_DIR local model dir               (qwen)
-#   NT_QUANT  4bit|""                        (qwen; 4-bit bitsandbytes)
-#   GLM_MODEL/GLM_API_KEY/GLM_AGENT          (glm)
-#   FAMILY    evolution family              (default elementwise)
-#   OPS_LIMIT operator task count           (default 6)
-#   B_GENS    evolution generations         (default 3)
-#   BLOCKS    space-separated block ids     (default "1 2 3")
+#   SOLVER    claude|qwen|glm|fake            (required)
+#   TAG       results label                   (required)
+#   SKILL_ROOT skill package root             (default: dir above this script)
+#   REPO_ROOT whole-repo clone root           (optional; enables the repo-aware sandbox
+#                                              for blocks 1+2 — the FAITHFUL test, with
+#                                              src/tests/CONTRIBUTING.md present, not just
+#                                              the isolated skill package. Requires the
+#                                              whole ninetoothed repo deployed there.)
+#   MODEL_DIR local model dir                 (qwen)
+#   NT_QUANT  4bit|""                          (qwen; 4-bit bitsandbytes)
+#   GLM_MODEL/GLM_API_KEY/GLM_AGENT            (glm)
+#   FAMILY    evolution family                (default elementwise)
+#   OPS_LIMIT operator task count             (default 6)
+#   B_GENS    evolution generations           (default 3)
+#   BLOCKS    space-separated block ids       (default "1 2 3")
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_ROOT="${SKILL_ROOT:-$(cd "$HERE/.." && pwd)}"
+REPO_ROOT="${REPO_ROOT:-}"
 : "${SOLVER:?set SOLVER=qwen|glm|fake}"
 : "${TAG:?set TAG=<label>}"
 FAMILY="${FAMILY:-elementwise}"
@@ -49,9 +55,10 @@ export PYTHONUNBUFFERED=1
 # solver-specific args threaded to run_matrix / moo_loop
 SOLVER_ARGS=(--solver "$SOLVER")
 [[ -n "${MODEL_DIR:-}" ]] && SOLVER_ARGS+=(--model-dir "$MODEL_DIR")
-[[ "$SOLVER" == "qwen" && -n "${MODEL_DIR:-}" ]] || true
+REPO_ARGS=()
+[[ -n "$REPO_ROOT" ]] && REPO_ARGS+=(--repo-root "$REPO_ROOT")
 
-echo "== run_comparison TAG=$TAG SOLVER=$SOLVER model=${GLM_MODEL:-${MODEL_DIR:-?}} blocks=[$BLOCKS] =="
+echo "== run_comparison TAG=$TAG SOLVER=$SOLVER model=${GLM_MODEL:-${MODEL_DIR:-?}} blocks=[$BLOCKS] repo_aware=$([[ -n "$REPO_ROOT" ]] && echo yes || echo no) =="
 echo "== results -> $RES =="
 
 RUNNER="$HERE/proxy_runner/run_matrix.py"
@@ -60,14 +67,14 @@ MOO="$HERE/evolve_moo/moo_loop.py"
 if [[ " $BLOCKS " == *" 1 "* ]]; then
   echo "===== [1] operator A/B: $OPS_LIMIT elementwise × {no_skill,v0} ====="
   python "$RUNNER" --skill-root "$SKILL_ROOT" --split all --limit "$OPS_LIMIT" \
-    --modes no_skill v0 "${SOLVER_ARGS[@]}" --run-id baseline \
+    --modes no_skill v0 "${SOLVER_ARGS[@]}" "${REPO_ARGS[@]}" --run-id baseline \
     --journal "$J" --csv "$RES/ab_operators.csv" --out-dir "$RES/ep_ops"
 fi
 
 if [[ " $BLOCKS " == *" 2 "* ]]; then
   echo "===== [2] diagnosis A/B: perf_diag × {no_skill,v0} ====="
   python "$RUNNER" --skill-root "$SKILL_ROOT" --split all --family perf_diag \
-    --modes no_skill v0 "${SOLVER_ARGS[@]}" --run-id baseline_diag \
+    --modes no_skill v0 "${SOLVER_ARGS[@]}" "${REPO_ARGS[@]}" --run-id baseline_diag \
     --journal "$J" --csv "$RES/ab_diagnosis.csv" --out-dir "$RES/ep_diag"
 fi
 

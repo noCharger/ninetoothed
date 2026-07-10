@@ -201,7 +201,7 @@ def main(argv=None) -> int:
     p.add_argument("--mode", default="a")
     p.add_argument("--no-git", action="store_true")
     p.add_argument("--fake", action="store_true")
-    p.add_argument("--solver", default="claude", choices=["claude", "qwen", "fake"])
+    p.add_argument("--solver", default="claude", choices=["claude", "qwen", "glm", "fake"])
     p.add_argument("--model-dir", default=None, help="local model dir for --solver qwen")
     args = p.parse_args(argv)
 

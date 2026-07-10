@@ -238,7 +238,7 @@ def main(argv=None) -> int:
     p.add_argument("--mode", default="b")
     p.add_argument("--no-git", action="store_true")
     p.add_argument("--fake", action="store_true", help="offline: stub solver + template drafter")
-    p.add_argument("--solver", default="claude", choices=["claude", "qwen", "fake"])
+    p.add_argument("--solver", default="claude", choices=["claude", "qwen", "glm", "fake"])
     p.add_argument("--model-dir", default=None, help="local model dir for --solver qwen")
     p.add_argument("--family", default=None, help="restrict to one operator family")
     p.add_argument("--limit", type=int, default=None, help="cap number of train tasks")

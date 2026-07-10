@@ -46,7 +46,7 @@ except Exception:  # pragma: no cover
     EpisodeRecord = None  # type: ignore
 
 
-# what the agent is asked to produce, by task kind
+# what the agent is asked to produce, by task kind (legacy flat-sandbox convention)
 _OPERATOR_DELIVERABLES = (
     "kernel.py (the NineToothed kernel), wrapper.py, and test_correctness.py (pytest "
     "cases across shapes and the task's dtypes). wrapper.py MUST expose "
@@ -58,6 +58,22 @@ _DIAGNOSIS_DELIVERABLES = (
     "diagnosis.md containing your root-cause analysis and the concrete fix. "
     "List each finding explicitly."
 )
+
+# repo-aware convention: contribute a real test file matching the project's own style
+# (see tests/test_add.py, tests/test_pow.py — import ninetoothed, define the kernel,
+# write a pytest test using tests.utils.get_available_devices).
+def _operator_deliverables_repo(task_id: str) -> str:
+    return (
+        f"a new file `tests/test_contrib_{task_id}.py`, following the style of the "
+        "EXISTING files in tests/ (e.g. tests/test_add.py, tests/test_pow.py — import "
+        "ninetoothed, define the kernel with ninetoothed.make() or @ninetoothed.jit, and "
+        "write a pytest test using tests.utils.get_available_devices, matching this "
+        "project's own conventions). This file MUST ALSO expose a top-level function "
+        "named exactly `solve` that takes the input tensors as positional arguments and "
+        "returns the output tensor — this is the stable entrypoint an independent grader "
+        "calls (in addition to whatever pytest test you write for yourself). "
+        "Do not modify any other existing file in the repository."
+    )
 
 
 @dataclass
@@ -77,18 +93,40 @@ Solver = Callable[[str, pathlib.Path, dict], SolverResult]
 
 
 # --------------------------------------------------------------------------- prompt
-def build_prompt(task_meta: dict, mode: str) -> str:
+def build_prompt(task_meta: dict, mode: str, repo_aware: bool = False) -> str:
     kind = task_meta.get("kind", "operator")
-    deliv = _OPERATOR_DELIVERABLES if kind == "operator" else _DIAGNOSIS_DELIVERABLES
     lines = []
-    if mode != "no_skill":
+    if repo_aware:
         lines.append(
-            "A `ninetoothed-operator-dev` skill is available (installed as a Claude Code "
-            "skill, and mirrored under ./skill/). USE IT: read its SKILL.md + the relevant "
-            "references, imitate its worked examples under examples/, and run its scripts "
-            "(scripts/run_correctness_matrix.py, scripts/debug_arrangement.py, "
-            "scripts/inspect_generated_source.py) to verify — follow its workflow and pitfalls."
+            "You are working inside a full clone of the `ninetoothed` repository (the "
+            "actual project this operator belongs to) — not an isolated sandbox. Explore "
+            "it: `tests/` has real examples of NineToothed operators (e.g. tests/test_add.py, "
+            "tests/test_pow.py) and shared helpers (tests/utils.py, tests/conftest.py); "
+            "`src/ninetoothed/` is the framework source; `CONTRIBUTING.md` has style "
+            "conventions. Your work should fit this codebase's existing patterns."
         )
+        if mode != "no_skill":
+            lines.append(
+                "A `ninetoothed-operator-dev` skill is also installed (auto-discovered "
+                "under .claude/skills/, and present at skills/competition/"
+                "ninetoothed-operator-dev/ in the repo). USE IT: read its SKILL.md + the "
+                "relevant references, imitate its worked examples under examples/, and run "
+                "its scripts (scripts/run_correctness_matrix.py, scripts/debug_arrangement.py, "
+                "scripts/inspect_generated_source.py) — follow its workflow and pitfalls."
+            )
+        deliv = _operator_deliverables_repo(task_meta["id"]) if kind == "operator" \
+            else _DIAGNOSIS_DELIVERABLES
+    else:
+        if mode != "no_skill":
+            lines.append(
+                "A `ninetoothed-operator-dev` skill is available (installed as a Claude Code "
+                "skill, and mirrored under ./skill/). USE IT: read its SKILL.md + the relevant "
+                "references, imitate its worked examples under examples/, and run its scripts "
+                "(scripts/run_correctness_matrix.py, scripts/debug_arrangement.py, "
+                "scripts/inspect_generated_source.py) to verify — follow its workflow and pitfalls."
+            )
+        deliv = _OPERATOR_DELIVERABLES if kind == "operator" else _DIAGNOSIS_DELIVERABLES
+
     lines.append(f"Task ({task_meta.get('category','?')}/{task_meta.get('difficulty','?')}): "
                  f"{task_meta.get('prompt','').strip()}")
     if kind == "diagnosis" and task_meta.get("scenario"):
@@ -99,16 +137,104 @@ def build_prompt(task_meta: dict, mode: str) -> str:
 
 
 # --------------------------------------------------------------------------- sandbox
+_SKILL_RELPATH = ("skills", "competition", "ninetoothed-operator-dev")  # within repo_root
+
+
 def prepare_sandbox(out_dir: pathlib.Path, run_id: str, generation: int,
-                    task_id: str, mode: str, skill_root: Optional[pathlib.Path]) -> pathlib.Path:
+                    task_id: str, mode: str, skill_root: Optional[pathlib.Path],
+                    repo_root: Optional[pathlib.Path] = None) -> pathlib.Path:
     ws = out_dir / "episodes" / run_id / f"gen{generation}" / f"{task_id}_{mode}"
     if ws.exists():
         shutil.rmtree(ws)
     ws.mkdir(parents=True)
-    if mode != "no_skill" and skill_root is not None:
+
+    if repo_root is not None:
+        # THE FAITHFUL TEST: the agent gets the whole repo it's contributing to, not just
+        # an isolated skill package. no_skill mode gets the bare repo (skills/ removed);
+        # v0/a/b get the repo with the skill present + installed for auto-discovery.
+        _copy_full_repo(ws, repo_root, mode)
+        if mode != "no_skill" and skill_root is not None:
+            _seed_skill(ws / "skill", skill_root)   # back-compat mirror for inline solvers
+            _install_skill(ws, skill_root)          # .claude/skills/ for claude-code discovery
+        _write_baseline_manifest(ws)                # snapshot BEFORE the agent touches anything
+    elif mode != "no_skill" and skill_root is not None:
         _seed_skill(ws / "skill", skill_root)                 # for inline solvers (qwen/glm-api)
         _install_skill(ws, skill_root)                        # for the real claude-code harness
     return ws
+
+
+# top-level entries of the repo that are safe/useful to give the agent. Excludes
+# .git (avoid real git/network temptation), the skill's evaluation/ harness (contains
+# the ANSWER KEY in proxy_tasks/ — must never be visible to an episode), and generated
+# result directories.
+_REPO_COPY_INCLUDE = ("src", "tests", "docs", "CONTRIBUTING.md", "README.md",
+                      "LICENSE", "pyproject.toml", "requirements.txt", "skills")
+_SKILL_EXCLUDE_SUBDIRS = ("evaluation",)  # never expose the harness/answer-key to an episode
+
+
+def _copy_full_repo(dest: pathlib.Path, repo_root: pathlib.Path, mode: str) -> None:
+    for name in _REPO_COPY_INCLUDE:
+        src = repo_root / name
+        if not src.exists():
+            continue
+        if name == "skills":
+            if mode == "no_skill":
+                continue  # bare repo: no skill content at all, not even unused on disk
+            _copy_skill_tree(src, dest / "skills")
+            continue
+        if src.is_dir():
+            shutil.copytree(src, dest / name, dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc",
+                                                          ".pytest_cache"))
+        else:
+            shutil.copy2(src, dest / name)
+
+
+def _copy_skill_tree(skills_src: pathlib.Path, skills_dest: pathlib.Path) -> None:
+    """Copy skills/ preserving structure, but excluding each skill's evaluation/ subdir
+    (the harness + answer-key proxy_tasks references — never given to an episode)."""
+    for item in skills_src.rglob("*"):
+        rel = item.relative_to(skills_src)
+        if any(part in _SKILL_EXCLUDE_SUBDIRS for part in rel.parts):
+            continue
+        if "__pycache__" in rel.parts or item.suffix == ".pyc":
+            continue
+        target = skills_dest / rel
+        if item.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, target)
+
+
+_MANIFEST_EXCLUDE_PARTS = (".claude", ".git", "__pycache__", ".pytest_cache", "skill")
+_MANIFEST_EXCLUDE_NAMES = ("_prompt.txt", "_baseline_manifest.json")
+
+
+def _walkable(rel: pathlib.PurePath) -> bool:
+    """True if `rel` is a real repo/deliverable path worth tracking — excludes hidden
+    dirs (.claude, .git, .pytest_cache), harness bookkeeping, and the solver-compat
+    skill/ mirror."""
+    return (not any(part.startswith(".") for part in rel.parts)
+           and not any(part in _MANIFEST_EXCLUDE_PARTS for part in rel.parts)
+           and rel.name not in _MANIFEST_EXCLUDE_NAMES)
+
+
+def _write_baseline_manifest(ws: pathlib.Path) -> None:
+    """Snapshot (relpath -> (size, mtime_ns)) for every pre-existing file, taken right
+    after the repo is copied in and BEFORE the agent runs. changed_files_repo_aware()
+    diffs against this to find exactly what the agent added/modified — a real diff,
+    not a whole-tree glob (which would be hundreds of pre-existing repo files)."""
+    manifest = {}
+    for p in ws.rglob("*"):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(ws)
+        if not _walkable(rel):
+            continue
+        st = p.stat()
+        manifest[str(rel)] = [st.st_size, st.st_mtime_ns]
+    (ws / "_baseline_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
 
 def _seed_skill(dest: pathlib.Path, skill_root: pathlib.Path) -> None:
@@ -165,6 +291,32 @@ def changed_files(ws: pathlib.Path) -> list[str]:
     return out
 
 
+def changed_files_repo_aware(ws: pathlib.Path) -> list[str]:
+    """Real diff against the pre-agent snapshot (_write_baseline_manifest): a file counts
+    as changed iff it's new or its (size, mtime) differs from the baseline. Necessary once
+    the sandbox is a full repo clone — "any file present" would return hundreds of
+    pre-existing repo files instead of what the agent actually touched."""
+    manifest_path = ws / "_baseline_manifest.json"
+    if not manifest_path.exists():
+        return changed_files(ws)   # no baseline recorded — fall back to legacy heuristic
+    baseline = json.loads(manifest_path.read_text(encoding="utf-8"))
+    out = []
+    for p in ws.rglob("*"):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(ws)
+        if rel.name in ("oracle_test.py",) or rel.name.startswith("test_harness_oracle_"):
+            continue     # harness-supplied grader, not the agent's own edit
+        if not _walkable(rel):
+            continue
+        key = str(rel)
+        st = p.stat()
+        cur = [st.st_size, st.st_mtime_ns]
+        if key not in baseline or baseline[key] != cur:
+            out.append(key)
+    return out
+
+
 # --------------------------------------------------------------------------- solvers
 def default_claude_solver(prompt: str, ws: pathlib.Path, opts: dict) -> SolverResult:
     """Invoke `claude -p --output-format json` inside the sandbox — the REAL agent harness.
@@ -174,6 +326,12 @@ def default_claude_solver(prompt: str, ws: pathlib.Path, opts: dict) -> SolverRe
     workflow via Bash. Backed by whatever model ANTHROPIC_BASE_URL/AUTH_TOKEN +
     ANTHROPIC_DEFAULT_*_MODEL point at (e.g. glm-5.2 via Zhipu's Anthropic endpoint).
     Needs IS_SANDBOX=1 in the env so --dangerously-skip-permissions works headless as root.
+
+    `compiled` here only reflects whether the CLI call itself succeeded (no crash/timeout/
+    API error) — NOT whether the deliverable is correct. That finer distinction (produced
+    nothing vs produced-but-wrong vs correct) is derived downstream in run_episode() from
+    the rubric's oracle result, which works uniformly for flat and repo-aware sandboxes
+    instead of assuming a fixed file layout inside the solver.
     """
     model = opts.get("model") or os.environ.get("NINETOOTHED_EPISODE_MODEL", "")
     timeout = int(opts.get("timeout", 1200))
@@ -190,25 +348,17 @@ def default_claude_solver(prompt: str, ws: pathlib.Path, opts: dict) -> SolverRe
         return SolverResult(wall_seconds=timeout, compiled=False, compile_attempts=0,
                             raw={"error": "timeout"})
     wall = time.time() - t0
-    res = _parse_claude_json(proc.stdout, wall)
-    # set the compiled flag from an independent solve() check (agent's own claims aside)
-    task_id = opts.get("task_id"); ptd = opts.get("proxy_tasks_dir")
-    if opts.get("kind", "operator") == "operator" and task_id and ptd:
-        try:
-            from qwen_solver import _solve_runs
-            ok, _ = _solve_runs(ws, task_id, ptd)
-            res.compiled = ok
-        except Exception:  # noqa: BLE001
-            pass
-    return res
+    return _parse_claude_json(proc.stdout, wall)
 
 
 def _parse_claude_json(stdout: str, wall: float) -> SolverResult:
     try:
         data = json.loads(stdout)
     except json.JSONDecodeError:
-        # streaming or plain text — still count wall time, tokens unknown
-        return SolverResult(wall_seconds=wall, raw={"stdout_head": stdout[:200]})
+        # streaming or plain text — still count wall time, tokens unknown; treat as a
+        # solver-level failure (couldn't even confirm the CLI call completed cleanly).
+        return SolverResult(wall_seconds=wall, compiled=False,
+                            raw={"stdout_head": stdout[:200]})
     usage = data.get("usage", {}) or {}
     tin = usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
     tout = usage.get("output_tokens", 0)
@@ -216,6 +366,7 @@ def _parse_claude_json(stdout: str, wall: float) -> SolverResult:
         tokens_in=tin, tokens_out=tout,
         cost_usd=data.get("total_cost_usd", 0.0),
         wall_seconds=data.get("duration_ms", wall * 1000) / 1000.0,
+        compiled=not bool(data.get("is_error", False)),
         raw={"num_turns": data.get("num_turns"), "subtype": data.get("subtype")},
     )
 
@@ -265,16 +416,25 @@ def run_episode(task_meta: dict, mode: str, skill_root: str | pathlib.Path,
                 out_dir: str | pathlib.Path, run_id: str = "baseline", generation: int = 0,
                 strategy: str = "", prompt_id: str = "", solver: Optional[Solver] = None,
                 solver_opts: Optional[dict] = None, reward_cfg: Optional[RewardConfig] = None,
-                dry_run: bool = False, prompt_override: Optional[str] = None):
+                dry_run: bool = False, prompt_override: Optional[str] = None,
+                repo_root: Optional[str | pathlib.Path] = None):
     """
     Returns (EpisodeRecord | dict, RubricResult). The caller logs the record.
     prompt_override lets version A inject a bandit-chosen strategy/prompt framing;
     when None the default task+skill prompt is used.
+
+    repo_root: when given, the episode sandbox is a full clone of the repo the skill
+    belongs to (src/, tests/, docs/, CONTRIBUTING.md — see prepare_sandbox/_copy_full_repo)
+    instead of just the skill package. This is the faithful test of a coding agent
+    actually contributing to the project, not an isolated skill-text excerpt.
     """
     skill_root = pathlib.Path(skill_root)
     out_dir = pathlib.Path(out_dir)
-    ws = prepare_sandbox(out_dir, run_id, generation, task_meta["id"], mode, skill_root)
-    prompt = prompt_override or build_prompt(task_meta, mode)
+    repo_root = pathlib.Path(repo_root) if repo_root else None
+    repo_aware = repo_root is not None
+    ws = prepare_sandbox(out_dir, run_id, generation, task_meta["id"], mode, skill_root,
+                         repo_root=repo_root)
+    prompt = prompt_override or build_prompt(task_meta, mode, repo_aware=repo_aware)
     (ws / "_prompt.txt").write_text(prompt, encoding="utf-8")
 
     if dry_run:
@@ -285,19 +445,36 @@ def run_episode(task_meta: dict, mode: str, skill_root: str | pathlib.Path,
     solver = solver or default_claude_solver
     opts = {**(solver_opts or {}), "task_id": task_meta["id"],
             "kind": task_meta.get("kind", "operator"),
-            "proxy_tasks_dir": str(skill_root / "evaluation" / "proxy_tasks")}
+            "proxy_tasks_dir": str(skill_root / "evaluation" / "proxy_tasks"),
+            "repo_aware": repo_aware}
     sres = solver(prompt, ws, opts)
 
     # For operator tasks, drop in the harness oracle test so completion is tamper-proof.
-    if task_meta.get("kind", "operator") == "operator":
+    is_operator = task_meta.get("kind", "operator") == "operator"
+    if is_operator:
         try:
-            from oracle import write_oracle_test
-            write_oracle_test(task_meta, ws, skill_root / "evaluation" / "proxy_tasks")
+            if repo_aware:
+                from oracle import write_oracle_test_repo_aware
+                write_oracle_test_repo_aware(task_meta, ws, skill_root / "evaluation" / "proxy_tasks")
+            else:
+                from oracle import write_oracle_test
+                write_oracle_test(task_meta, ws, skill_root / "evaluation" / "proxy_tasks")
         except Exception:  # noqa: BLE001  (oracle is best-effort; agent test is fallback)
             pass
 
+    changed_fn = changed_files_repo_aware if repo_aware else changed_files
+    changed = changed_fn(ws)
+
     tmeta = dict(task_meta, _mode=mode)
-    rubric = score_episode(ws, tmeta, skill_root, out_dir / "rubric", changed_files(ws))
+    rubric = score_episode(ws, tmeta, skill_root, out_dir / "rubric", changed,
+                           repo_aware=repo_aware)
+
+    # Refine "did it even run" independent of the solver's own claim: for operator tasks,
+    # the agent's deliverable file must exist, or nothing was produced to grade at all.
+    if is_operator:
+        deliverable = (ws / "tests" / f"test_contrib_{task_meta['id']}.py") if repo_aware \
+            else (ws / "wrapper.py")
+        sres.compiled = sres.compiled and deliverable.exists()
 
     # shaped reward: prefer latency/roofline outcome if a bench result exists, else rubric-based
     correct = rubric.subscores["completion"].value >= 3
@@ -318,8 +495,7 @@ def run_episode(task_meta: dict, mode: str, skill_root: str | pathlib.Path,
                   "wall_seconds": round(sres.wall_seconds, 2),
                   "compile_attempts": sres.compile_attempts},
             classification="none" if correct else "failed",
-            artifacts={"workspace": str(ws),
-                       "changed": ",".join(changed_files(ws)[:12])},
+            artifacts={"workspace": str(ws), "changed": ",".join(changed[:12])},
             notes=json.dumps(rubric.to_dict()["subscores"], ensure_ascii=False),
         )
     return rec, rubric
@@ -339,6 +515,9 @@ def main(argv=None) -> int:
     p.add_argument("task_id")
     p.add_argument("--mode", default="v0", choices=["no_skill", "v0", "a", "b"])
     p.add_argument("--skill-root", required=True)
+    p.add_argument("--repo-root", default=None,
+                   help="whole-repo clone root (contains src/, tests/, skills/); enables "
+                        "the repo-aware sandbox instead of an isolated skill-only one")
     p.add_argument("--manifest", default=None, help="proxy_tasks/manifest.json")
     p.add_argument("--out-dir", default="./evaluation/results/_adhoc")
     p.add_argument("--run-id", default="adhoc")
@@ -357,7 +536,7 @@ def main(argv=None) -> int:
     solver = resolve_solver(args.solver, args.model_dir) if not args.dry_run else None
     rec, rubric = run_episode(task_meta, args.mode, skill_root, args.out_dir,
                               run_id=args.run_id, generation=args.generation,
-                              solver=solver, dry_run=args.dry_run)
+                              solver=solver, dry_run=args.dry_run, repo_root=args.repo_root)
     if args.dry_run:
         return 0
     print(json.dumps(rubric.to_dict(), ensure_ascii=False, indent=2))

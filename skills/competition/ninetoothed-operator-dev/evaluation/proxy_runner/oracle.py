@@ -79,6 +79,73 @@ def write_oracle_test(task_meta: dict, workspace: str | pathlib.Path,
     return path
 
 
+# --------------------------------------------------------------------------- repo-aware
+# For the repo-aware sandbox (see run_episode.prepare_sandbox/_copy_full_repo), the
+# agent's deliverable is tests/test_contrib_<task_id>.py (a real project test file, not
+# an isolated wrapper.py). The oracle lives alongside it at
+# tests/test_harness_oracle_<task_id>.py — same tests/ package, same conftest.py fixtures
+# a real CI run would use — and imports the agent's `solve` from THAT module rather than
+# a flat wrapper.py. Grading is run with cwd = repo root (see rubric_scorer.py).
+_ORACLE_TEMPLATE_REPO = '''\
+# AUTO-GENERATED oracle test — do not edit. Correctness of the agent's `{entry}` in
+# tests/test_contrib_{task_id}.py against the proxy task reference. Independent of the
+# agent's own test in that same file.
+import sys, pathlib
+import pytest, torch
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]   # tests/ -> repo root
+sys.path.insert(0, str(_REPO_ROOT))
+_PROXY = pathlib.Path({proxy_tasks_dir!r})
+sys.path.insert(0, str(_PROXY))
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+
+_MERE_THRESH = {{"float32": 1.22e-4, "float16": 9.77e-4, "bfloat16": 7.81e-3}}
+
+def _load_task():
+    from loader import load_all
+    for t in load_all():
+        if t.id == {task_id!r}:
+            return t
+    raise RuntimeError("task {task_id} not found")
+
+def _mere_mare(got, ref):
+    got = got.float(); ref = ref.float()
+    eps = 1e-8
+    rel = (got - ref).abs() / (ref.abs() + eps)
+    return rel.mean().item(), rel.max().item()
+
+@pytest.mark.parametrize("dtype", {dtypes!r})
+def test_oracle(dtype):
+    task = _load_task()
+    from tests.test_contrib_{task_id} import {entry} as _solve
+    inputs = task.make_inputs(device="cuda", dtype=dtype)
+    ref = task.reference(*[x.clone() for x in inputs])
+    got = _solve(*[x.clone() for x in inputs])
+    assert torch.is_tensor(got), "solve did not return a tensor"
+    assert got.shape == ref.shape, f"shape {{got.shape}} != {{ref.shape}}"
+    thr = _MERE_THRESH.get(dtype, 1e-3)
+    mere, mare = _mere_mare(got, ref)
+    assert mere < thr and mare < 10 * thr, f"MERE={{mere:.2e}} MARE={{mare:.2e}} thr={{thr:.2e}}"
+'''
+
+
+def write_oracle_test_repo_aware(task_meta: dict, workspace: str | pathlib.Path,
+                                 proxy_tasks_dir: str | pathlib.Path) -> pathlib.Path:
+    """Write tests/test_harness_oracle_<id>.py into the repo-clone workspace."""
+    ws = pathlib.Path(workspace)
+    dtypes = list(task_meta.get("dtypes", ["float32", "float16"]))
+    src = _ORACLE_TEMPLATE_REPO.format(
+        entry=ENTRY, task_id=task_meta["id"], dtypes=dtypes,
+        proxy_tasks_dir=str(proxy_tasks_dir),
+    )
+    tests_dir = ws / "tests"
+    tests_dir.mkdir(parents=True, exist_ok=True)
+    path = tests_dir / f"test_harness_oracle_{task_meta['id']}.py"
+    path.write_text(src, encoding="utf-8")
+    return path
+
+
 if __name__ == "__main__":
     import tempfile
     ws = pathlib.Path(tempfile.mkdtemp())
@@ -86,4 +153,25 @@ if __name__ == "__main__":
     txt = p.read_text()
     assert "test_oracle" in txt and "ew06" in txt and "solve" in txt
     compile(txt, str(p), "exec")   # must be valid python
-    print("oracle self-test OK:", p)
+    print("oracle (flat) self-test OK:", p)
+
+    # repo-aware variant: verify the import chain actually resolves against a real
+    # tests/ package on disk (not just that the template compiles).
+    repo = pathlib.Path(tempfile.mkdtemp())
+    (repo / "tests").mkdir()
+    (repo / "tests" / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "tests" / "test_contrib_ew01.py").write_text(
+        "def solve(a, b):\n    return a + b\n", encoding="utf-8")  # no torch: this Mac has none
+    p2 = write_oracle_test_repo_aware({"id": "ew01", "dtypes": ["float32"]}, repo, "/tmp/proxy")
+    assert p2 == repo / "tests" / "test_harness_oracle_ew01.py"
+    txt2 = p2.read_text()
+    compile(txt2, str(p2), "exec")
+    assert "from tests.test_contrib_ew01 import solve" in txt2
+    # simulate the actual import resolution pytest would do at collection time (the real
+    # deliverable imports torch, but that's a GPU-host concern — here we only need to
+    # confirm the `tests.test_contrib_<id>` package path resolves correctly)
+    import sys as _sys
+    _sys.path.insert(0, str(repo))
+    from tests.test_contrib_ew01 import solve as _s  # noqa: E402
+    assert _s(1, 2) == 3
+    print("oracle (repo-aware) self-test OK:", p2)

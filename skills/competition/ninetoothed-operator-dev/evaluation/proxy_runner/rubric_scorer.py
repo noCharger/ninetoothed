@@ -61,6 +61,10 @@ _ALLOWED_EDIT_BASENAMES = {
 # assert against, and flagging that would be a false positive, not a real cheat.
 _SOLUTION_BASENAMES = {"kernel.py", "kernel_fixed.py", "wrapper.py"}
 
+# repo-aware deliverable: tests/test_contrib_<task_id>.py — same role as _SOLUTION_BASENAMES
+# but per-task-named, so matched by pattern instead of exact set membership.
+_CONTRIB_TEST_RE = re.compile(r"^test_contrib_[A-Za-z0-9_]+\.py$")
+
 _NETWORK_TOKENS = ("socket", "urllib", "requests", "http.client", "httpx", "aiohttp")
 
 
@@ -108,25 +112,31 @@ def _python_files(workspace: pathlib.Path) -> list[pathlib.Path]:
 
 
 def _run_correctness_matrix(test_file: pathlib.Path, matrix_csv: pathlib.Path,
-                            skill_root: pathlib.Path) -> tuple[float, str]:
+                            skill_root: pathlib.Path,
+                            cwd: Optional[pathlib.Path] = None) -> tuple[float, str]:
     """
     Shell out to scripts/run_correctness_matrix.py. Returns (pass_fraction, reason).
     pass_fraction in [0,1]; a torch/CUDA-absent SKIP is treated as "unknown" (0.0)
     with an explicit reason so offline runs don't fake a pass.
+
+    cwd: for the repo-aware sandbox this MUST be the repo root (not test_file.parent),
+    so pytest's package-rootdir mechanism resolves `tests.test_contrib_<id>` imports —
+    matching how a real CI run would invoke the suite. Defaults to test_file.parent for
+    the legacy flat sandbox (unchanged behaviour).
     """
     script = skill_root / "scripts" / "run_correctness_matrix.py"
     if not script.exists():
-        return 0.0, f"run_correctness_matrix.py not found at {script}"
+        return 0.0, f"run_correctness_matrix.py not found at {script}", ""
     if not test_file.exists():
-        return 0.0, "no test file produced"
+        return 0.0, "no test file produced", ""
     # NOTE: run_correctness_matrix uses argparse.REMAINDER, so --csv MUST precede the
     # positional test file, else it is swallowed as a pytest arg.
     cmd = [sys.executable, str(script), "--csv", str(matrix_csv), str(test_file)]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
-                              cwd=str(test_file.parent))
+                              cwd=str(cwd or test_file.parent))
     except subprocess.TimeoutExpired:
-        return 0.0, "correctness matrix timed out (600s)"
+        return 0.0, "correctness matrix timed out (600s)", ""
     out = proc.stdout + "\n" + proc.stderr
     # Prefer parsing the CSV the script writes; fall back to stdout counts.
     frac, reason = _parse_matrix_csv(matrix_csv)
@@ -193,17 +203,27 @@ def _parse_matrix_stdout(out: str, returncode: int) -> tuple[float, str]:
 
 # --------------------------------------------------------------------------- sub-scorers
 def score_completion(workspace: pathlib.Path, task_meta: dict, skill_root: pathlib.Path,
-                     out_dir: pathlib.Path) -> tuple[SubScore, float]:
+                     out_dir: pathlib.Path, repo_aware: bool = False,
+                     changed: Optional[list[pathlib.Path]] = None) -> tuple[SubScore, float, str]:
     kind = task_meta.get("kind", "operator")
     if kind == "diagnosis":
         return _score_completion_diagnosis(workspace, task_meta)
-    # Prefer the harness-supplied oracle test (tamper-proof) over the agent's own test.
-    test_file = _find(workspace, "oracle_test.py") or \
-        _find(workspace, "test_correctness.py", f"test_{task_meta.get('name','')}.py")
+    cwd = None
+    if repo_aware:
+        # fixed location written by oracle.write_oracle_test_repo_aware; cwd = repo root
+        # so pytest resolves `tests.test_contrib_<id>` package imports.
+        candidate = workspace / "tests" / f"test_harness_oracle_{task_meta['id']}.py"
+        test_file = candidate if candidate.exists() else \
+            _find(workspace, f"test_contrib_{task_meta['id']}.py")
+        cwd = workspace
+    else:
+        # Prefer the harness-supplied oracle test (tamper-proof) over the agent's own test.
+        test_file = _find(workspace, "oracle_test.py") or \
+            _find(workspace, "test_correctness.py", f"test_{task_meta.get('name','')}.py")
     if test_file is None:
         return SubScore(0, 4, "no oracle/test file present"), 0.0, "no oracle/test file produced"
     matrix_csv = out_dir / f"matrix_{task_meta['id']}_{workspace.name}.csv"
-    frac, reason, detail = _run_correctness_matrix(test_file, matrix_csv, skill_root)
+    frac, reason, detail = _run_correctness_matrix(test_file, matrix_csv, skill_root, cwd=cwd)
     # map fraction -> 0..4 : full=4, partial 1..3, none=0
     if frac >= 0.999:
         val = 4
@@ -217,7 +237,7 @@ def score_completion(workspace: pathlib.Path, task_meta: dict, skill_root: pathl
     # legality convention), has not fulfilled the task even though the numbers match —
     # cap its completion so the skill's real-API value is what counts.
     if val >= 2:
-        legality_reason = _legality_violation(workspace, skill_root)
+        legality_reason = _legality_violation(workspace, skill_root, files=changed)
         if legality_reason:
             val = 1
             reason += f" (capped: {legality_reason})"
@@ -226,10 +246,18 @@ def score_completion(workspace: pathlib.Path, task_meta: dict, skill_root: pathl
     return SubScore(val, 4, reason), frac, detail
 
 
-def _uses_ninetoothed(workspace: pathlib.Path) -> bool:
-    """True if the produced code genuinely builds a NineToothed kernel (import + make)."""
-    for p in _python_files(workspace):
-        if p.name == "oracle_test.py":
+def _uses_ninetoothed(workspace: pathlib.Path,
+                      files: Optional[list[pathlib.Path]] = None) -> bool:
+    """True if the produced code genuinely builds a NineToothed kernel (import + make).
+
+    `files` restricts the scan to exactly these paths (repo-aware mode: the agent's diff,
+    not the whole repo tree — src/ninetoothed/make.py itself would trivially match
+    "ninetoothed" + "make(" and produce a false positive over hundreds of pre-existing
+    files otherwise). Legacy flat mode (files=None) globs the whole small workspace."""
+    for p in (files if files is not None else _python_files(workspace)):
+        if p.name == "oracle_test.py" or p.name.startswith("test_harness_oracle_"):
+            continue
+        if not p.exists():
             continue
         src = p.read_text(encoding="utf-8", errors="ignore")
         if "ninetoothed" in src and re.search(r"\bmake\s*\(", src):
@@ -237,26 +265,31 @@ def _uses_ninetoothed(workspace: pathlib.Path) -> bool:
     return False
 
 
-def _legality_violation(workspace: pathlib.Path, skill_root: pathlib.Path) -> str:
+def _legality_violation(workspace: pathlib.Path, skill_root: pathlib.Path,
+                        files: Optional[list[pathlib.Path]] = None) -> str:
     """MusaCoder/KernelBench legality gate: a solution that never touches NineToothed,
     or that reaches for a banned torch/aten fallback (matmul/conv/reduction/attention),
     has not completed the task even if its output happens to be numerically correct.
     Returns a reason string, or "" if legal."""
-    if not _uses_ninetoothed(workspace):
+    if not _uses_ninetoothed(workspace, files=files):
         return "solution does not use NineToothed (no import+make)"
-    banned = _banned_fallback_hits(workspace, skill_root)
+    banned = _banned_fallback_hits(workspace, skill_root, files=files)
     if banned:
         return f"banned aten/torch fallback used — {banned[0]}"
     return ""
 
 
-def _banned_fallback_hits(workspace: pathlib.Path, skill_root: pathlib.Path) -> list[str]:
+def _banned_fallback_hits(workspace: pathlib.Path, skill_root: pathlib.Path,
+                          files: Optional[list[pathlib.Path]] = None) -> list[str]:
     guard = _load_reward_hacking_guard(skill_root)
     if guard is None:
         return []
     hits: list[str] = []
-    for p in _python_files(workspace):
-        if p.name not in _SOLUTION_BASENAMES:
+    candidates = files if files is not None else _python_files(workspace)
+    for p in candidates:
+        if p.name not in _SOLUTION_BASENAMES and not _CONTRIB_TEST_RE.match(p.name):
+            continue
+        if not p.exists():
             continue
         try:
             hits.extend(guard.banned_fallback_analysis(source_code=p.read_text(
@@ -358,14 +391,17 @@ def score_minimality(changed_files: list[str]) -> SubScore:
     if not changed_files:
         return SubScore(1, 1, "no change set provided — assume minimal")
     offenders = [f for f in changed_files
-                 if pathlib.Path(f).name not in _ALLOWED_EDIT_BASENAMES]
+                 if pathlib.Path(f).name not in _ALLOWED_EDIT_BASENAMES
+                 and not _CONTRIB_TEST_RE.match(pathlib.Path(f).name)]
     if offenders:
         return SubScore(0, 1, f"touched non-allowed files: {offenders[:4]}")
     return SubScore(1, 1, f"only allowed files touched ({len(changed_files)})")
 
 
-def score_style(workspace: pathlib.Path) -> SubScore:
-    pys = _python_files(workspace)
+def score_style(workspace: pathlib.Path,
+               files: Optional[list[pathlib.Path]] = None) -> SubScore:
+    pys = [p for p in files if p.suffix == ".py"] if files is not None else _python_files(workspace)
+    pys = [p for p in pys if p.exists()]
     if not pys:
         return SubScore(0, 1, "no python produced")
     # all produced python must at least parse
@@ -395,9 +431,13 @@ def _try_ruff(paths: list[str]) -> Optional[int]:
 
 
 def score_compliance(workspace: pathlib.Path, skill_root: pathlib.Path,
-                     generated_source: Optional[pathlib.Path]) -> SubScore:
+                     generated_source: Optional[pathlib.Path],
+                     files: Optional[list[pathlib.Path]] = None) -> SubScore:
     reasons = []
-    for p in _python_files(workspace):
+    pys = [p for p in files if p.suffix == ".py"] if files is not None else _python_files(workspace)
+    for p in pys:
+        if not p.exists():
+            continue
         src = p.read_text(encoding="utf-8", errors="ignore")
         if re.search(r"\beval\s*\(", src) or re.search(r"\bexec\s*\(", src):
             reasons.append(f"{p.name}: eval/exec")
@@ -411,7 +451,7 @@ def score_compliance(workspace: pathlib.Path, skill_root: pathlib.Path,
     # legality gate: banned torch/aten matmul-conv-reduction fallback anywhere in the
     # solution (MusaCoder/KernelBench convention — also caps completion, see
     # score_completion / _legality_violation; a hit here docks compliance too).
-    reasons.extend(_banned_fallback_hits(workspace, skill_root))
+    reasons.extend(_banned_fallback_hits(workspace, skill_root, files=files))
     if reasons:
         return SubScore(0, 1, "; ".join(reasons[:4]))
     return SubScore(1, 1, "no eval/exec/network; static guard clean")
@@ -430,31 +470,41 @@ def _try_static_guard(generated_source: pathlib.Path, skill_root: pathlib.Path) 
 
 # --------------------------------------------------------------------------- top-level
 def score_episode(workspace: str | pathlib.Path, task_meta: dict, skill_root: str | pathlib.Path,
-                  out_dir: str | pathlib.Path, changed_files: Optional[list[str]] = None) -> RubricResult:
+                  out_dir: str | pathlib.Path, changed_files: Optional[list[str]] = None,
+                  repo_aware: bool = False) -> RubricResult:
     """
     Score one episode workspace against one proxy task.
 
     Args:
         workspace     : directory holding the agent's produced files for this task.
+                        In repo-aware mode this is a full repo clone, not an isolated dir.
         task_meta     : a manifest task dict (id, kind, name, expected_findings, ...).
         skill_root    : ninetoothed-operator-dev root (for scripts/ + evaluation/).
         out_dir       : where to write matrix_<id>.csv artifacts.
-        changed_files : optional list of file paths the episode modified (git diff).
+        changed_files : file paths the episode modified, relative to workspace (from
+                        run_episode.changed_files / changed_files_repo_aware). In
+                        repo_aware mode this is the ONLY set style/compliance/legality
+                        scan — the workspace itself has hundreds of pre-existing repo
+                        files that must never be attributed to the agent.
+        repo_aware    : True when workspace is a whole-repo clone (see run_episode.py).
     """
     workspace = pathlib.Path(workspace)
     skill_root = pathlib.Path(skill_root)
     out_dir = pathlib.Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    changed_files = changed_files or []
+    changed_paths = [workspace / f for f in changed_files] if repo_aware else None
 
-    completion, frac, completion_error = score_completion(workspace, task_meta, skill_root, out_dir)
+    completion, frac, completion_error = score_completion(
+        workspace, task_meta, skill_root, out_dir, repo_aware=repo_aware, changed=changed_paths)
     gensrc = _find(workspace, "generated_source.txt")
     subs = {
         "completion": completion,
         "test": score_test(frac, workspace, out_dir, task_meta["id"]),
         "perf": score_perf(workspace, task_meta),
-        "minimality": score_minimality(changed_files or []),
-        "style": score_style(workspace),
-        "compliance": score_compliance(workspace, skill_root, gensrc),
+        "minimality": score_minimality(changed_files),
+        "style": score_style(workspace, files=changed_paths),
+        "compliance": score_compliance(workspace, skill_root, gensrc, files=changed_paths),
     }
     res = RubricResult(task_id=task_meta["id"], mode=task_meta.get("_mode", "?"),
                        subscores=subs, matrix_pass_frac=frac, completion_error=completion_error)
@@ -470,12 +520,15 @@ def main(argv=None) -> int:
     p.add_argument("--skill-root", required=True)
     p.add_argument("--out-dir", default="./_rubric_out")
     p.add_argument("--changed", nargs="*", default=None)
+    p.add_argument("--repo-aware", action="store_true",
+                   help="workspace is a whole-repo clone, not an isolated skill sandbox")
     args = p.parse_args(argv)
 
     tm_arg = args.task_meta
     task_meta = json.loads(pathlib.Path(tm_arg).read_text()) if pathlib.Path(tm_arg).exists() \
         else json.loads(tm_arg)
-    res = score_episode(args.workspace, task_meta, args.skill_root, args.out_dir, args.changed)
+    res = score_episode(args.workspace, task_meta, args.skill_root, args.out_dir, args.changed,
+                        repo_aware=args.repo_aware)
     print(json.dumps(res.to_dict(), ensure_ascii=False, indent=2))
     return 0
 

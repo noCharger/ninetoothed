@@ -56,7 +56,8 @@ def load_tasks(manifest: pathlib.Path, split: str, family: str = None) -> list[d
 
 def run_matrix(skill_root, manifest, split, modes, out_dir, run_id, generation,
                journal_path=None, csv_path=None, fake=False, dry_run=False,
-               limit=None, solver_name="claude", model_dir=None, family=None):
+               limit=None, solver_name="claude", model_dir=None, family=None,
+               repo_root=None):
     skill_root = pathlib.Path(skill_root)
     out_dir = pathlib.Path(out_dir)
     tasks = load_tasks(pathlib.Path(manifest), split, family)
@@ -73,7 +74,7 @@ def run_matrix(skill_root, manifest, split, modes, out_dir, run_id, generation,
         for mode in modes:
             rec, rubric = run_episode(
                 t, mode, skill_root, out_dir, run_id=run_id, generation=generation,
-                solver=solver, dry_run=dry_run,
+                solver=solver, dry_run=dry_run, repo_root=repo_root,
             )
             if dry_run:
                 continue
@@ -136,6 +137,8 @@ def run_matrix(skill_root, manifest, split, modes, out_dir, run_id, generation,
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Batch-run proxy tasks × modes.")
     p.add_argument("--skill-root", required=True)
+    p.add_argument("--repo-root", default=None,
+                   help="whole-repo clone root; enables the repo-aware sandbox")
     p.add_argument("--manifest", default=None)
     p.add_argument("--split", default="all", choices=["all", "train", "holdout"])
     p.add_argument("--modes", nargs="+", default=["no_skill", "v0"])
@@ -157,7 +160,8 @@ def main(argv=None) -> int:
     out_dir = args.out_dir or skill_root / "evaluation" / "results"
     run_matrix(skill_root, manifest, args.split, args.modes, out_dir, args.run_id,
                args.generation, args.journal, args.csv, args.fake, args.dry_run, args.limit,
-               solver_name=args.solver, model_dir=args.model_dir, family=args.family)
+               solver_name=args.solver, model_dir=args.model_dir, family=args.family,
+               repo_root=args.repo_root)
     return 0
 
 
