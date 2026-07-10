@@ -201,15 +201,19 @@ def main(argv=None) -> int:
     p.add_argument("--mode", default="a")
     p.add_argument("--no-git", action="store_true")
     p.add_argument("--fake", action="store_true")
+    p.add_argument("--solver", default="claude", choices=["claude", "qwen", "fake"])
+    p.add_argument("--model-dir", default=None, help="local model dir for --solver qwen")
     args = p.parse_args(argv)
 
     skill_root = pathlib.Path(args.skill_root).resolve()
     out_dir = args.out_dir or skill_root / "evaluation" / "results"
     cfg = LoopAConfig(generations=args.generations, use_git=not args.no_git)
-    solver = None
     if args.fake:
         from run_matrix import _FAKE_FILES
         solver = _make_fake(_FAKE_FILES)
+    else:
+        from run_episode import resolve_solver
+        solver = resolve_solver(args.solver, args.model_dir)
     result = run_loop_a(skill_root, out_dir, args.journal, cfg, solver=solver, mode=args.mode)
     print(json.dumps({k: v for k, v in result.items() if k != "prob_trace"},
                      ensure_ascii=False, indent=2))

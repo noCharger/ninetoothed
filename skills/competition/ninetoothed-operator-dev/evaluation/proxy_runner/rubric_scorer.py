@@ -70,6 +70,7 @@ class RubricResult:
     subscores: dict = field(default_factory=dict)   # name -> SubScore
     matrix_pass_frac: float = 0.0
     total: int = 0
+    completion_error: str = ""    # real failure detail (traceback/assertion) for attribution
 
     def as_scores(self) -> dict:
         return {k: v.value for k, v in self.subscores.items()}
@@ -121,9 +122,27 @@ def _run_correctness_matrix(test_file: pathlib.Path, matrix_csv: pathlib.Path,
     out = proc.stdout + "\n" + proc.stderr
     # Prefer parsing the CSV the script writes; fall back to stdout counts.
     frac, reason = _parse_matrix_csv(matrix_csv)
-    if frac is not None:
-        return frac, reason
-    return _parse_matrix_stdout(out, proc.returncode)
+    if frac is None:
+        frac, reason = _parse_matrix_stdout(out, proc.returncode)
+    detail = _first_failure_detail(out) if frac < 0.999 else ""
+    return frac, reason, detail
+
+
+def _first_failure_detail(out: str) -> str:
+    """Pull the most informative failure line (Error/assert) from pytest output, for
+    the evolution loop's failure attribution."""
+    lines = out.splitlines()
+    # prefer an explicit exception/assertion line
+    for ln in lines:
+        s = ln.strip()
+        if s.startswith("E   ") and any(k in s for k in
+                ("Error", "assert", "Exception", "MERE", "not defined", "argument",
+                 "mismatch", "no attribute", "nan")):
+            return s[4:].strip()[:300]
+    for ln in lines:
+        if "Error" in ln or "error" in ln:
+            return ln.strip()[:300]
+    return ""
 
 
 def _parse_matrix_csv(matrix_csv: pathlib.Path) -> tuple[Optional[float], str]:
@@ -174,9 +193,9 @@ def score_completion(workspace: pathlib.Path, task_meta: dict, skill_root: pathl
     test_file = _find(workspace, "oracle_test.py") or \
         _find(workspace, "test_correctness.py", f"test_{task_meta.get('name','')}.py")
     if test_file is None:
-        return SubScore(0, 4, "no oracle/test file present"), 0.0
+        return SubScore(0, 4, "no oracle/test file present"), 0.0, "no oracle/test file produced"
     matrix_csv = out_dir / f"matrix_{task_meta['id']}_{workspace.name}.csv"
-    frac, reason = _run_correctness_matrix(test_file, matrix_csv, skill_root)
+    frac, reason, detail = _run_correctness_matrix(test_file, matrix_csv, skill_root)
     # map fraction -> 0..4 : full=4, partial 1..3, none=0
     if frac >= 0.999:
         val = 4
@@ -190,7 +209,9 @@ def score_completion(workspace: pathlib.Path, task_meta: dict, skill_root: pathl
     if val >= 2 and not _uses_ninetoothed(workspace):
         val = 1
         reason += " (capped: solution does not use NineToothed)"
-    return SubScore(val, 4, reason), frac
+        if not detail:
+            detail = "solution does not use NineToothed (no import+make)"
+    return SubScore(val, 4, reason), frac, detail
 
 
 def _uses_ninetoothed(workspace: pathlib.Path) -> bool:
@@ -204,16 +225,17 @@ def _uses_ninetoothed(workspace: pathlib.Path) -> bool:
     return False
 
 
-def _score_completion_diagnosis(workspace: pathlib.Path, task_meta: dict) -> tuple[SubScore, float]:
+def _score_completion_diagnosis(workspace: pathlib.Path, task_meta: dict) -> tuple[SubScore, float, str]:
     findings = [f.lower() for f in task_meta.get("expected_findings", [])]
     if not findings:
-        return SubScore(0, 4, "task has no expected_findings"), 0.0
+        return SubScore(0, 4, "task has no expected_findings"), 0.0, ""
     diag = _find(workspace, "diagnosis.md", "notes.md")
     text = diag.read_text(encoding="utf-8", errors="ignore").lower() if diag else ""
     hit = sum(1 for f in findings if _finding_hit(f, text))
     frac = hit / len(findings)
     val = round(frac * 4)
-    return SubScore(val, 4, f"diagnosis hit {hit}/{len(findings)} expected findings"), frac
+    detail = "" if frac >= 0.999 else f"missed findings: {[f for f in findings if not _finding_hit(f, text)][:3]}"
+    return SubScore(val, 4, f"diagnosis hit {hit}/{len(findings)} expected findings"), frac, detail
 
 
 def _finding_hit(finding: str, text: str) -> bool:
@@ -354,7 +376,7 @@ def score_episode(workspace: str | pathlib.Path, task_meta: dict, skill_root: st
     out_dir = pathlib.Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    completion, frac = score_completion(workspace, task_meta, skill_root, out_dir)
+    completion, frac, completion_error = score_completion(workspace, task_meta, skill_root, out_dir)
     gensrc = _find(workspace, "generated_source.txt")
     subs = {
         "completion": completion,
@@ -365,7 +387,7 @@ def score_episode(workspace: str | pathlib.Path, task_meta: dict, skill_root: st
         "compliance": score_compliance(workspace, skill_root, gensrc),
     }
     res = RubricResult(task_id=task_meta["id"], mode=task_meta.get("_mode", "?"),
-                       subscores=subs, matrix_pass_frac=frac)
+                       subscores=subs, matrix_pass_frac=frac, completion_error=completion_error)
     res.total = sum(min(s.value, s.max) for s in subs.values())
     return res
 

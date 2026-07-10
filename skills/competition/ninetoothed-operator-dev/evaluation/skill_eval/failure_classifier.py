@@ -74,6 +74,19 @@ _GUIDANCE_ERROR_PATTERNS: list[tuple[str, str]] = [
      "meta-op not available on this Tensor subtype — reference example may be wrong version"),
     (r"TypeError.*block_size\(\).*constexpr",
      "block_size() vs Symbol(constexpr=True) confused in reference example"),
+    # generic NineToothed calling-convention gaps — these recur when the skill does not
+    # teach the exact launch signature, so they are guidance (skill) gaps, not code slips.
+    (r"unexpected keyword argument",
+     "kernel launched with a keyword arg it doesn't accept — pass ALL tensors "
+     "positionally, e.g. kernel(a, b, output, BLOCK_SIZE=...), never output=output"),
+    (r"got multiple values for argument",
+     "mixed positional/keyword launch — pass tensors positionally in arrangement order"),
+    (r"(ndim|rank|dimension).*(mismatch|match)|expected \d+ dim|got \d+ dim",
+     "tensor rank does not match the kernel's tile rank — tile every dim of the real "
+     "shape (a 2-D input needs a 2-D tile, e.g. tile((BM, BN)))"),
+    (r"MERE=nan|nan.*thr|got nan",
+     "NaN in output usually means part of the tensor was never written — the kernel's "
+     "tile rank/grid does not cover the full (multi-dim) shape"),
 ]
 
 

@@ -81,9 +81,10 @@ def evaluate_split(skill_root: pathlib.Path, tasks: list[dict], mode: str,
         if journal and rec is not None:
             journal.append_episode(rec)
         if rubric.subscores["completion"].value < 4:
-            # reconstruct a best-effort error string from the completion reason
-            failures.append(Failure(task_id=t["id"], family=_family(t),
-                                     error_text=rubric.subscores["completion"].reason))
+            # feed the REAL failure detail (traceback/assertion) to attribution, so the
+            # classifier can recognise the guidance gap; fall back to the summary reason.
+            err = rubric.completion_error or rubric.subscores["completion"].reason
+            failures.append(Failure(task_id=t["id"], family=_family(t), error_text=err))
     return totals, failures
 
 
@@ -91,10 +92,15 @@ def _family(task: dict) -> str:
     return task.get("category", "unknown")
 
 
-def load_train_tasks(skill_root: pathlib.Path) -> list[dict]:
+def load_train_tasks(skill_root: pathlib.Path, family: str = None, limit: int = None) -> list[dict]:
     manifest = skill_root / "evaluation" / "proxy_tasks" / "manifest.json"
     data = json.loads(manifest.read_text(encoding="utf-8"))
-    return [t for t in data["tasks"] if t.get("split") == "train"]
+    tasks = [t for t in data["tasks"] if t.get("split") == "train"]
+    if family:
+        tasks = [t for t in tasks if t.get("category") == family]
+    if limit:
+        tasks = tasks[:limit]
+    return tasks
 
 
 @dataclass
@@ -103,6 +109,8 @@ class LoopConfig:
     max_proposals: int = 3
     use_git: bool = True
     allow_flat: bool = True
+    family: str = None      # restrict train tasks to one operator family
+    limit: int = None       # cap number of train tasks (cost control)
 
 
 def _git(skill_repo: pathlib.Path, *args: str) -> Optional[str]:
@@ -123,7 +131,7 @@ def run_loop(skill_root: str | pathlib.Path, out_dir: str | pathlib.Path,
     jnl = Journal(journal_path)
     drafter = drafter or llm_drafter
 
-    tasks = load_train_tasks(skill_root)
+    tasks = load_train_tasks(skill_root, cfg.family, cfg.limit)
     history = []
     applied: set[tuple] = set()   # (op, target_file, heading, before_heading) already promoted
 
@@ -230,13 +238,26 @@ def main(argv=None) -> int:
     p.add_argument("--mode", default="b")
     p.add_argument("--no-git", action="store_true")
     p.add_argument("--fake", action="store_true", help="offline: stub solver + template drafter")
+    p.add_argument("--solver", default="claude", choices=["claude", "qwen", "fake"])
+    p.add_argument("--model-dir", default=None, help="local model dir for --solver qwen")
+    p.add_argument("--family", default=None, help="restrict to one operator family")
+    p.add_argument("--limit", type=int, default=None, help="cap number of train tasks")
     args = p.parse_args(argv)
 
     skill_root = pathlib.Path(args.skill_root).resolve()
     out_dir = args.out_dir or skill_root / "evaluation" / "results"
-    cfg = LoopConfig(generations=args.generations, use_git=not args.no_git)
-    solver = _make_fake(_fake_files()) if args.fake else None
-    drafter = template_drafter if args.fake else llm_drafter
+    cfg = LoopConfig(generations=args.generations, use_git=not args.no_git,
+                     family=args.family, limit=args.limit)
+    if args.fake:
+        solver, drafter = _make_fake(_fake_files()), template_drafter
+    else:
+        from run_episode import resolve_solver
+        solver = resolve_solver(args.solver, args.model_dir)
+        if args.solver == "qwen":
+            from qwen_solver import make_qwen_drafter
+            drafter = make_qwen_drafter(args.model_dir)
+        else:
+            drafter = llm_drafter
     result = run_loop(skill_root, out_dir, args.journal, cfg, solver=solver,
                       drafter=drafter, mode=args.mode)
     print(json.dumps(result, ensure_ascii=False, indent=2))

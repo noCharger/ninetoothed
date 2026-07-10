@@ -196,6 +196,36 @@ def _solve_runs(ws: pathlib.Path, task_id: str, proxy_tasks_dir: str) -> tuple[b
     return False, (proc.stderr or proc.stdout)[-900:]
 
 
+def qwen_generate(model_dir: str, system: str, user: str, max_new_tokens: int = 512) -> str:
+    """One-shot chat generation reusing the cached model. Used by the version-B drafter."""
+    tok, model = _load(model_dir)
+    msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    text, _, _ = _generate(tok, model, msgs, max_new_tokens)
+    return text
+
+
+def make_qwen_drafter(model_dir: str):
+    """A version-B drafter that asks the local model to rewrite a skill reference section
+    to prevent the observed failures. Reuses the already-loaded model (no reload)."""
+    def _drafter(skill_root, target_file, heading, context: dict) -> str:
+        errs = "\n".join(f"- {s}" for s in context.get("error_samples", []))
+        system = ("You improve a GPU-operator skill's reference text. Output ONLY the "
+                  "replacement markdown body for the named section — concrete, <10 lines, "
+                  "giving the exact correct NineToothed idiom and a one-line why. No preamble.")
+        user = (f"Operator family: {context.get('family')}. Section heading: '{heading}'.\n"
+                f"These failures recurred because the guidance was insufficient:\n{errs}\n"
+                f"Classifier hint: {context.get('repair_hint')}\n\n"
+                "Write the corrected/added guidance (markdown bullets).")
+        try:
+            body = qwen_generate(model_dir, system, user, max_new_tokens=400).strip()
+            # strip any accidental code fences / markers
+            body = _strip_fences(body) if "```" in body or "=== FILE" in body else body
+            return body or context.get("repair_hint", "")
+        except Exception:  # noqa: BLE001
+            return context.get("repair_hint", "")
+    return _drafter
+
+
 def make_qwen_solver(model_dir: str, max_new_tokens: int = 3072, repair_rounds: int = 2):
     """Return a Solver closure: (prompt, ws, opts) -> SolverResult. Loads model once."""
     from run_episode import SolverResult   # local import to avoid cycle at module load

@@ -122,8 +122,9 @@ def build_prompt(task_meta: dict, arm: Arm, memories: Optional[dict] = None,
                      "./skill/SKILL.md and the relevant ./skill/references/*.md first.")
     parts.append(f"Task ({task_meta.get('category','?')}): {task_meta.get('prompt','').strip()}")
     parts.append(f"Optimisation guidance: {framing}")
-    parts.append("Produce kernel.py, wrapper.py, test_correctness.py, and (if perf "
-                 "matters) bench.csv with a bound verdict. No network access.")
+    parts.append("Produce kernel.py, wrapper.py (exposing `def solve(*inputs)` — the "
+                 "grader calls solve()), test_correctness.py, and (if perf matters) "
+                 "bench.csv with a bound verdict. Absolute imports. No network access.")
     return "\n\n".join(parts)
 
 
