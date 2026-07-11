@@ -65,7 +65,9 @@ All external material this `.skill` relies on, disclosed per rules §11 / §6.
 ## Companion evaluation harness
 
 This skill package is self-contained (no network, no external repo dependency at
-run time). A separate repo, `ninetoothed-skill-eval-harness`, holds all A/B
+run time). A separate repo,
+[`ninetoothed-skill-eval-harness`](https://github.com/noCharger/ninetoothed-skill-eval-harness),
+holds all A/B
 measurement and self-evolution tooling used to develop and validate it (proxy
 task set + answer key, the `claude -p`/local-model/GLM-API automation, and the
 two evolution routes referenced above). It is not required to install or run

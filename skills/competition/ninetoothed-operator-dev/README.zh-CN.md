@@ -35,8 +35,9 @@ ninetoothed-operator-dev/
 
 本包自包含——运行时无网络、无外部仓库依赖。A/B 测量与自进化工具(24 题
 离线集+答案、`claude -p`/本地模型/GLM API 自动化、两版进化路线)在独立
-的配套仓库 `ninetoothed-skill-eval-harness` 中;安装或运行本 skill 均不
-依赖它。
+的配套仓库
+[`ninetoothed-skill-eval-harness`](https://github.com/noCharger/ninetoothed-skill-eval-harness)
+中;安装或运行本 skill 均不依赖它。
 
 ## 安装 / 激活
 

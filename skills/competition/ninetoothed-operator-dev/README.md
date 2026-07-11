@@ -37,8 +37,9 @@ ninetoothed-operator-dev/
 This package is self-contained — no network, no external repo dependency at run
 time. A/B measurement and self-evolution tooling (the 24-task proxy set + answer
 key, `claude -p`/local-model/GLM-API automation, and the two evolution routes)
-live in a separate companion repo, `ninetoothed-skill-eval-harness`; it is not
-required to install or run this skill.
+live in a separate companion repo,
+[`ninetoothed-skill-eval-harness`](https://github.com/noCharger/ninetoothed-skill-eval-harness);
+it is not required to install or run this skill.
 
 ## Install / activate
 
