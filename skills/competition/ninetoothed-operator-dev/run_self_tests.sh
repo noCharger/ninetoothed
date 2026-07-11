@@ -1,15 +1,25 @@
 #!/usr/bin/env bash
-# run_self_tests.sh — one-click self-test runner for ninetoothed-operator-dev.
+# run_self_tests.sh — regression check for the 4 shipped worked examples.
 #
-# Runs the 4 self-test examples in both A (no-skill) and B (with-skill) modes,
-# reports per-task outcomes, and prints a summary table.
+# NOT a with-skill/no-skill A/B: both "primary" and "repeat" runs execute the
+# SAME pre-written examples/**/test_correctness.py (the shipped reference
+# solution), so there is nothing here for a skill to help or hurt. Its only
+# job is to catch regressions in the examples themselves (e.g. a NineToothed
+# API change breaking a shipped kernel) and flag CUDA nondeterminism (a
+# passing example should pass identically both times).
+#
+# The REAL with/without-skill comparison — a fresh agent solving each task
+# once with the skill loaded and once without — lives in the companion
+# evaluation harness repo (`run_comparison.sh`, blocks 1+2; see this skill's
+# README's "Companion evaluation harness" section). That is the only
+# comparison that counts for judging the skill; see RUNBOOK.md there.
 #
 # Usage:
-#   bash run_self_tests.sh             # run both A and B
+#   bash run_self_tests.sh             # run primary + repeat
 #   bash run_self_tests.sh --ab-only   # correctness only, no benchmark tests
-#   bash run_self_tests.sh --b-only    # skip no-skill baseline (faster)
+#   bash run_self_tests.sh --b-only    # skip the repeat run (faster)
 #
-# Exit code: 0 if all with-skill (B) tests pass; 1 otherwise.
+# Exit code: 0 if all primary-run tests pass; 1 otherwise.
 
 set -uo pipefail
 
@@ -73,7 +83,7 @@ echo ""
 
 declare -A B_STATUS A_STATUS
 
-echo "[ B: with-skill ]"
+echo "[ primary run ]"
 for key in 01 02 03 04; do
   path="${EX_PATH[$key]}"
   log="$LOG_DIR/B_${key}.log"
@@ -87,7 +97,7 @@ done
 echo ""
 
 if [[ "$SKIP_A" == "false" ]]; then
-  echo "[ A: no-skill baseline ]"
+  echo "[ repeat run (nondeterminism check) ]"
   for key in 01 02 03 04; do
     path="${EX_PATH[$key]}"
     log="$LOG_DIR/A_${key}.log"
@@ -124,7 +134,7 @@ echo ""
 echo "======================================================================"
 echo "  Summary"
 echo "======================================================================"
-printf "  %-32s  %-8s  %-8s\n" "Example" "B(skill)" "A(baseline)"
+printf "  %-32s  %-8s  %-8s\n" "Example" "primary" "repeat"
 echo "  ------------------------------------------------------------"
 for key in 01 02 03 04; do
   bs="${B_STATUS[$key]:-NOT_RUN}"
@@ -139,9 +149,9 @@ for key in 01 02 03 04; do
 done
 
 if $all_b_pass; then
-  echo "  ✓ All with-skill (B) tests PASSED.  Logs: $LOG_DIR/"
+  echo "  ✓ All shipped examples PASSED (primary run).  Logs: $LOG_DIR/"
   exit 0
 else
-  echo "  ✗ Some with-skill (B) tests FAILED.  See: $LOG_DIR/"
+  echo "  ✗ Some shipped examples FAILED (primary run).  See: $LOG_DIR/"
   exit 1
 fi
