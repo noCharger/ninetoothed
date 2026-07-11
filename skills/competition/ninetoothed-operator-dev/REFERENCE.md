@@ -17,8 +17,11 @@ All external material this `.skill` relies on, disclosed per rules §11 / §6.
   - `simulate_arrangement` — `src/ninetoothed/debugging.py`
   - `visualize(..., save_path=)` / `visualize_arrangement` — `src/ninetoothed/visualization.py`
 - **Example kernels** (patterns adapted, repo style followed):
-  `ops/ninetoothed/kernels/{add,softmax,mm,max_pool2d,...}.py` and
-  `tests/test_ops.py` from the NineToothed examples repo.
+  `tests/{test_add,test_softmax,test_matmul,test_max_pool2d,...}.py` from the
+  NineToothed repo itself — each defines its kernel inline (via
+  `ninetoothed.make()` or the `@ninetoothed.jit` decorator) alongside a
+  parametrized pytest test using `tests.utils.get_available_devices()`; this
+  skill's `references/*` and `examples/*` follow that same convention.
 
 ## Design rationale (methodology, not code)
 
@@ -30,12 +33,19 @@ All external material this `.skill` relies on, disclosed per rules §11 / §6.
   v0; experimental only).
 - **Anthropic Agent Skills** — `docs.claude.com/en/docs/agents-and-tools/agent-skills`
   — package layout, progressive disclosure, scripts-for-determinism.
+- **Ascend agent-skills** (`github.com/Ascend/agent-skills`) — Code Repair
+  (fix the kernel) vs Prompt Repair (fix the skill text) as distinct repair
+  targets for a failed attempt. → motivates `scripts/failure_classifier.py`'s
+  `code_error`/`guidance_error`/`unknown` split (deterministic, rule-based —
+  no LLM call), used both live (see "Classify before retrying" above) and by
+  the companion evaluation harness's Stage 3 edit-targeting.
 - **KernelSwift** (Shanghai AI Lab) — three-technique reward-hacking detection
   (static AST analysis / dynamic runtime analysis / NCU roofline sanity check).
-  → `evaluation/skill_eval/reward_hacking_guard.py` implements technique 1 and 2
-  (no root/profiling access for NCU); `evaluation/skill_eval/robust_bench.py`'s
-  outlier-removal + bandwidth-sanity check borrows the same paper's fixed-graph
-  and IQR-outlier-removal measurement protocol.
+  → the companion evaluation harness repo's `skill_eval/reward_hacking_guard.py`
+  implements technique 1 and 2 (no root/profiling access for NCU);
+  `skill_eval/robust_bench.py`'s outlier-removal + bandwidth-sanity check
+  borrows the same paper's fixed-graph and IQR-outlier-removal measurement
+  protocol. (Evaluation-only; not part of this skill package.)
 - **KernelBench** (arXiv 2502.10517, Stanford Scaling Intelligence Lab) — the
   `Model`/`ModelNew`/`get_inputs()` task contract and its three-gate grading
   (compiles → `torch.allclose` correctness on random inputs → legality); v0.1's
@@ -46,10 +56,20 @@ All external material this `.skill` relies on, disclosed per rules §11 / §6.
 - **MusaCoder** (arXiv 2606.04847, Moore Threads AI) — bans `aten::*`/cuBLAS
   high-level fallback (matmul/conv/reduce family) in generated kernels, detected
   via static + runtime analysis in its MooreEval sandbox, "命中即零奖励" (a hit
-  zeroes the reward). → motivates `banned_fallback_analysis()` in
-  `evaluation/skill_eval/reward_hacking_guard.py` (static/AST half only — no
-  runtime/profiler confirmation) and its wiring into `rubric_scorer.py`'s
-  completion cap and compliance sub-score.
+  zeroes the reward). → motivates `banned_fallback_analysis()` in the companion
+  evaluation harness repo's `skill_eval/reward_hacking_guard.py` (static/AST
+  half only — no runtime/profiler confirmation) and its wiring into that
+  repo's `rubric_scorer.py` completion cap and compliance sub-score.
+  (Evaluation-only; not part of this skill package.)
+
+## Companion evaluation harness
+
+This skill package is self-contained (no network, no external repo dependency at
+run time). A separate repo, `ninetoothed-skill-eval-harness`, holds all A/B
+measurement and self-evolution tooling used to develop and validate it (proxy
+task set + answer key, the `claude -p`/local-model/GLM-API automation, and the
+two evolution routes referenced above). It is not required to install or run
+this skill; it exists only to measure and evolve it.
 
 ## Tooling
 

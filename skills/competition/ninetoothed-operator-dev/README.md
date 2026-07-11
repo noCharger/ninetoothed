@@ -24,16 +24,21 @@ ninetoothed-operator-dev/
     inspect_generated_source.py # read ~/.ninetoothed/<sha256>.py, report tiles/ops (read-only)
     bench_compare.py            # CUDA-event timing + Roofline classifier (importable)
     debug_arrangement.py        # verify an arrangement before compiling the kernel
+    failure_classifier.py       # classify a failure as code_error / guidance_error / unknown
+    strategy_selector.py        # read references/rules.json (if distilled), recommend an action
     aot_build_smoke.sh          # check AOT build produced .py + .h
   examples/                 # 4 worked self-test tasks (one per family)
   tests/
     self_test_tasks.md      # the 4 self-test tasks (mirror the hidden-task families)
     verifier_spec.md        # pass/fail rules aligned to the official 6 sub-scores
-  evaluation/               # self-test harness (not part of the installable skill)
-    proxy_tasks/            # 24-task offline set for A/B and Stage 3
-    skill_eval/             # robust bench, reward-hacking guard, failure classifier
   REFERENCE.md              # citations & provenance
 ```
+
+This package is self-contained — no network, no external repo dependency at run
+time. A/B measurement and self-evolution tooling (the 24-task proxy set + answer
+key, `claude -p`/local-model/GLM-API automation, and the two evolution routes)
+live in a separate companion repo, `ninetoothed-skill-eval-harness`; it is not
+required to install or run this skill.
 
 ## Install / activate
 

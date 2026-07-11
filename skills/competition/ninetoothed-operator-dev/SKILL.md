@@ -81,7 +81,7 @@ Families: `elementwise` · `reduction` · `layout` · `perf-diag`
   | `guidance_error` | same symptom ≥ 2 times; API mismatch not in `common-errors.md` | The skill text has a gap. Note it in the trace — do **not** keep fixing the kernel. Report as "skill gap: <description>" and fall through to PyTorch. |
   | `unknown` | neither rule fires | Escalate: add the pattern to `common-errors.md` after root-cause analysis. |
 
-  Use `evaluation/skill_eval/failure_classifier.py`
+  Use `scripts/failure_classifier.py`
   (`classify(error_text, oob_count, symptom_history)`) for deterministic
   classification. If `guidance_error` fires, the fix belongs in
   `references/<family>.md`, not in the kernel — this is a distinct repair path.

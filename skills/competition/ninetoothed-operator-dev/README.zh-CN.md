@@ -23,16 +23,20 @@ ninetoothed-operator-dev/
     inspect_generated_source.py # 读 ~/.ninetoothed/<sha256>.py,报告 tile/算子(只读)
     bench_compare.py            # CUDA Event 计时 + Roofline 分类(可 import)
     debug_arrangement.py        # 编译 kernel 前验证 arrangement
+    failure_classifier.py       # 把失败归类为 code_error / guidance_error / unknown
+    strategy_selector.py        # 读 references/rules.json(若已蒸馏),推荐动作
     aot_build_smoke.sh          # 检查 AOT 构建产出 .py + .h
   examples/                 # 4 个完整自测任务(每类一个)
   tests/
     self_test_tasks.md      # 4 个自测任务(对应隐藏任务四类)
     verifier_spec.md        # 与官方 6 子项对齐的通过/不通过规则
-  evaluation/               # 自测脚手架(不属于可安装的 skill 本体)
-    proxy_tasks/            # 24 题离线集,用于 A/B 与 Stage 3
-    skill_eval/             # 稳健 bench、reward-hacking 防护、失败归因
   REFERENCE.md              # 引用与来源
 ```
+
+本包自包含——运行时无网络、无外部仓库依赖。A/B 测量与自进化工具(24 题
+离线集+答案、`claude -p`/本地模型/GLM API 自动化、两版进化路线)在独立
+的配套仓库 `ninetoothed-skill-eval-harness` 中;安装或运行本 skill 均不
+依赖它。
 
 ## 安装 / 激活
 
