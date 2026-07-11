@@ -25,7 +25,6 @@ ninetoothed-operator-dev/
     bench_compare.py            # CUDA-event timing + Roofline classifier (importable)
     debug_arrangement.py        # verify an arrangement before compiling the kernel
     failure_classifier.py       # classify a failure as code_error / guidance_error / unknown
-    strategy_selector.py        # read references/rules.json (if distilled), recommend an action
     aot_build_smoke.sh          # check AOT build produced .py + .h
   examples/                 # 4 worked self-test tasks (one per family)
   tests/
@@ -39,7 +38,10 @@ time. A/B measurement and self-evolution tooling (the 24-task proxy set + answer
 key, `claude -p`/local-model/GLM-API automation, and the two evolution routes)
 live in a separate companion repo,
 [`ninetoothed-skill-eval-harness`](https://github.com/noCharger/ninetoothed-skill-eval-harness);
-it is not required to install or run this skill.
+it is not required to install or run this skill. That repo's experimental
+skill-editing route may add `scripts/strategy_selector.py` +
+`references/rules.json` here — but only once it has genuinely produced validated
+rules; as shipped today, neither file exists.
 
 ## Install / activate
 

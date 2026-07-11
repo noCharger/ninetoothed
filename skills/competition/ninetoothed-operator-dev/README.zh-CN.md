@@ -24,7 +24,6 @@ ninetoothed-operator-dev/
     bench_compare.py            # CUDA Event 计时 + Roofline 分类(可 import)
     debug_arrangement.py        # 编译 kernel 前验证 arrangement
     failure_classifier.py       # 把失败归类为 code_error / guidance_error / unknown
-    strategy_selector.py        # 读 references/rules.json(若已蒸馏),推荐动作
     aot_build_smoke.sh          # 检查 AOT 构建产出 .py + .h
   examples/                 # 4 个完整自测任务(每类一个)
   tests/
@@ -37,7 +36,9 @@ ninetoothed-operator-dev/
 离线集+答案、`claude -p`/本地模型/GLM API 自动化、两版进化路线)在独立
 的配套仓库
 [`ninetoothed-skill-eval-harness`](https://github.com/noCharger/ninetoothed-skill-eval-harness)
-中;安装或运行本 skill 均不依赖它。
+中;安装或运行本 skill 均不依赖它。该仓库的实验性 skill 自动编辑路线可能会
+向本目录添加 `scripts/strategy_selector.py` + `references/rules.json`——但仅在
+它真正产出经验证的规则之后;当前发布版本中两者均不存在。
 
 ## 安装 / 激活
 
